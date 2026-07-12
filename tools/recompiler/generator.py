@@ -171,7 +171,15 @@ class Generator:
             return ['(void)0;']
 
         if m == 'bra':
-            return self._transfer(a, instr.targets[0])
+            target = instr.targets[0]
+            transfer = self._transfer(a, target)
+            # Streets of Rage spends its idle time in this single back-edge
+            # while waiting for the next VBlank-driven state transition. Yield
+            # briefly here without slowing any other recompiled game code.
+            if self.label(target) == 'game_infinite_loop' and \
+                    self.part.func_of(a) == self.part.func_of(target):
+                return ['usleep(3);'] + transfer
+            return transfer
 
         if m.startswith('b') and m[1:] in _CC and m not in ('bra',):
             cc = _CC[m[1:]]
@@ -551,6 +559,7 @@ _SOURCE_PREAMBLE = '''\
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <unistd.h>
 
 {cast_macros}
 
