@@ -461,3 +461,24 @@ def test_csv_names_applied_to_goto_labels():
     assert 'my_loop:' in src
     assert 'goto my_loop;' in src
     assert 'L000106:' not in src
+
+
+def test_manual_function_keeps_declaration_calls_and_dispatch_but_omits_body():
+    ins = {
+        0x100: _instr('jsr', None, [], FlowType.CALL),
+        0x102: _instr('rts', None, [], FlowType.RETURN),
+        0x200: _instr('rts', None, [], FlowType.RETURN),
+    }
+    ins[0x100].targets = [0x200]
+    for address in ins:
+        ins[address].address = address
+
+    gen = Generator(ins, {0x100, 0x200}, names={0x200: 'manual_wait'},
+                    manual_functions={0x200})
+    source = gen.emit_source()
+    header = gen.emit_header()
+
+    assert 'void manual_wait(m_long entry_ = 0x0200u);' in header
+    assert 'case 0x0200u: manual_wait(); return;' in source
+    assert 'manual_wait();' in _function_source(source, 'sub_000100')
+    assert 'void Sor::manual_wait(' not in source

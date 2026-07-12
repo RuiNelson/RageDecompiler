@@ -71,7 +71,7 @@ class Stats:
 class Generator:
     def __init__(self, instructions, subroutines, rom_path='rom/StreetsOfRage.bin',
                  names=None, speculative_addrs=None, speculative_scope=None,
-                 baseline_instrs=None):
+                 baseline_instrs=None, manual_functions=None):
         self.ins = instructions
         self.part = partition(instructions, subroutines)
         self.rom_path = rom_path
@@ -83,6 +83,9 @@ class Generator:
         # _speculative_scope: all Phase-2-derived functions (seeds + derivatives)
         # — these get their full address list instead of the baseline-filtered one.
         self._speculative_scope = set(speculative_scope or self._speculative)
+        # Functions implemented by hand retain generated declarations, calls,
+        # and dispatch entries, but their C++ bodies are omitted.
+        self._manual_functions = set(manual_functions or [])
         # Effective instruction addresses per function.
         # Baseline functions are restricted to Phase-1 addresses so that phantom
         # instructions injected by overlapping speculative decodes are excluded.
@@ -471,6 +474,8 @@ class Generator:
         bodies = {}
         rejected = set()
         for e in self.part.entries:
+            if e in self._manual_functions:
+                continue
             try:
                 bodies[e] = '\n'.join(self._emit_function(self.part.functions[e]))
             except Exception:
@@ -490,7 +495,8 @@ class Generator:
         # Re-translate: _transfer now knows which targets are rejected and emits
         # dispatch() for them so their callers still link correctly.
         bodies = {e: '\n'.join(self._emit_function(self.part.functions[e]))
-                  for e in self.part.entries if e not in rejected}
+                  for e in self.part.entries
+                  if e not in rejected and e not in self._manual_functions}
 
         disp = ['void Sor::dispatch(m_long addr) {', '    switch (addr) {']
         for e in self.part.entries:
@@ -505,7 +511,7 @@ class Generator:
         parts.append('\n'.join(disp))
 
         for e in self.part.entries:
-            if e not in rejected:
+            if e not in rejected and e not in self._manual_functions:
                 parts.append(bodies[e])
 
         return '\n\n'.join(parts) + '\n'

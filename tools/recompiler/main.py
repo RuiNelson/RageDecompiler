@@ -404,6 +404,9 @@ def main(argv=None):
                     help='CSV of code-segment names (address,label,comment)')
     ap.add_argument('--addresses-csv', default='code-analysis/addresses.csv',
                     help='CSV of address labels (address,label,comment)')
+    ap.add_argument('--manual-functions', default='',
+                    help='address file listing functions declared and dispatched '
+                         'normally but implemented in hand-written C++')
     ap.add_argument('-v', '--verbose', action='store_true')
     args = ap.parse_args(argv)
 
@@ -443,11 +446,18 @@ def main(argv=None):
     if os.path.exists(args.labels_csv):
         names.update(_load_labels_csv(args.labels_csv)[0])
 
+    manual_functions = set(_load_aux(args.manual_functions))
+    unknown_manual = manual_functions - set(disasm.subroutines)
+    if unknown_manual:
+        formatted = ', '.join(f'${address:06X}' for address in sorted(unknown_manual))
+        ap.error(f'manual function address(es) are not subroutine entries: {formatted}')
+
     gen = Generator(disasm.instructions, disasm.subroutines,
                     rom_path=args.rom, names=names,
                     speculative_addrs=speculative_seeds,
                     speculative_scope=speculative_derived,
-                    baseline_instrs=baseline_instrs)
+                    baseline_instrs=baseline_instrs,
+                    manual_functions=manual_functions)
     source = gen.emit_source()   # must run first — populates self._rejected
     header = gen.emit_header()
 
@@ -461,6 +471,8 @@ def main(argv=None):
     total = s.handled + s.stubbed
     print(f'[recompile] {len(disasm.instructions)} instructions, '
           f'{len(gen.part.entries)} functions')
+    if manual_functions:
+        print(f'[recompile] {len(manual_functions)} function(s) supplied by hand-written C++')
     print(f'[recompile] translated {s.handled}/{total} '
           f'({100 * s.handled / total:.1f}%), {s.stubbed} stubbed')
     if s.stub_mnemonics:
