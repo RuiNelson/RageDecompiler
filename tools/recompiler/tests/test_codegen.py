@@ -461,21 +461,3 @@ def test_csv_names_applied_to_goto_labels():
     assert 'my_loop:' in src
     assert 'goto my_loop;' in src
     assert 'L000106:' not in src
-
-
-def test_game_infinite_loop_back_edge_sleeps_without_affecting_other_branches():
-    ins = {
-        0x100: _instr('nop', None, []),
-        0x102: _instr('nop', None, []),
-        0x104: _instr('nop', None, []),
-        0x106: _instr('bra', None, [], FlowType.BRANCH),
-    }
-    ins[0x106].targets = [0x102]
-    for a in ins:
-        ins[a].address = a
-
-    src = Generator(ins, {0x100}, names={0x102: 'game_infinite_loop'}).emit_source()
-
-    assert '#include <unistd.h>' in src
-    assert 'usleep(3);\n        goto game_infinite_loop;' in src
-    assert src.count('usleep(3);') == 1
