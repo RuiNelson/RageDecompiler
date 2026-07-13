@@ -12,7 +12,9 @@ come from the labels CSV when present (falling back to ``sub_XXXXXX`` /
 ``L{addr}``).
 """
 
+import bisect
 import re
+from collections import deque
 
 from tools.disassembler.instruction import FlowType, EAMode
 from tools.recompiler import cpp_semantics as sem
@@ -57,6 +59,59 @@ def _sanitize(name: str) -> str | None:
     return ident
 
 
+def _speculative_owner_overrides(instructions, speculative_addrs,
+                                 speculative_scope):
+    """Assign Phase-2 instructions to the speculative flow that reached them.
+
+    Numeric partitioning alone is insufficient for overlapping 68000 decodes.
+    For example, a speculative instruction at $014EA0 falls through to $014EA4
+    while a baseline four-byte instruction starts at $014EA2.  Addresses after
+    $014EA2 still belong to the $014EA0 speculative flow even though their
+    nearest preceding subroutine entry is the baseline one.
+
+    Walk each speculative function entry concurrently so roots claim themselves
+    before their successors. Calls keep their fall-through in the caller while
+    call targets are owned by their own disassembler-created subroutine root.
+    """
+    speculative_addrs = set(speculative_addrs or [])
+    roots = sorted(e for e in set(speculative_scope or []) if e in instructions)
+    if not speculative_addrs or not roots:
+        return {}
+
+    root_set = set(roots)
+    owners = {}
+    pending = deque((entry, entry) for entry in roots)
+    while pending:
+        addr, owner = pending.popleft()
+        if addr not in speculative_addrs or addr in owners:
+            continue
+        if addr in root_set and addr != owner:
+            continue
+        owners[addr] = owner
+        instr = instructions[addr]
+        if instr.flow is FlowType.RETURN:
+            successors = []
+        elif instr.flow is FlowType.BRANCH:
+            successors = list(instr.targets)
+        elif instr.flow is FlowType.CALL:
+            successors = [instr.next_address]
+        elif instr.flow is FlowType.CONDITIONAL:
+            successors = list(instr.targets) + [instr.next_address]
+        else:
+            successors = [instr.next_address]
+        for successor in successors:
+            if successor not in root_set or successor == owner:
+                pending.append((successor, owner))
+
+    # All Phase-2 instructions should be reachable from a Phase-2 subroutine
+    # root. Keep generation total if a malformed graph says otherwise by using
+    # the nearest speculative root rather than falling back to a baseline owner.
+    for addr in speculative_addrs - owners.keys():
+        i = bisect.bisect_right(roots, addr) - 1
+        owners[addr] = roots[i] if i >= 0 else roots[0]
+    return owners
+
+
 class Stats:
     def __init__(self):
         self.handled = 0
@@ -71,18 +126,27 @@ class Stats:
 class Generator:
     def __init__(self, instructions, subroutines, rom_path='rom/StreetsOfRage.bin',
                  names=None, speculative_addrs=None, speculative_scope=None,
-                 baseline_instrs=None, manual_functions=None):
+                 baseline_instrs=None, manual_functions=None,
+                 confirm_addrs=None):
         self.ins = instructions
-        self.part = partition(instructions, subroutines)
         self.rom_path = rom_path
         self.stats = Stats()
         self._names = names or {}
-        # _speculative: raw seeds promoted only when an indirect dispatch lands
-        # on them. Direct calls within generated code must not confirm aux hits.
-        self._speculative = set(speculative_addrs or [])
+        # Phase-2 addresses determine overlapping-flow ownership. Confirmable
+        # addresses are broader in discovery builds: they also include baseline
+        # instruction boundaries which are not already function entries, since
+        # an indirect call may land in the middle of known code.
+        phase2_addrs = set(speculative_addrs or [])
+        self._speculative = set(
+            phase2_addrs if confirm_addrs is None else confirm_addrs)
         # _speculative_scope: all Phase-2-derived functions (seeds + derivatives)
         # — these get their full address list instead of the baseline-filtered one.
-        self._speculative_scope = set(speculative_scope or self._speculative)
+        self._speculative_scope = set(
+            phase2_addrs if speculative_scope is None else speculative_scope)
+        speculative_owners = _speculative_owner_overrides(
+            instructions, phase2_addrs, self._speculative_scope)
+        self.part = partition(instructions, subroutines,
+                              owner_overrides=speculative_owners)
         # Functions implemented by hand retain generated declarations, calls,
         # and dispatch entries, but their C++ bodies are omitted.
         self._manual_functions = set(manual_functions or [])
@@ -97,11 +161,29 @@ class Generator:
         }
         # Set version of _eff_addrs for O(1) membership in _transfer.
         self._addrs_sets = {e: set(addrs) for e, addrs in self._eff_addrs.items()}
+        # Keep only addresses that have an emitted owner/body.  In particular,
+        # this excludes phantom instructions introduced when a speculative
+        # decode overlaps a baseline function and baseline filtering removes
+        # them from that function's effective address list.
+        self._speculative = {
+            addr for addr in self._speculative
+            if addr in self.ins
+            and self.part.func_of(addr) in self._addrs_sets
+            and addr in self._addrs_sets[self.part.func_of(addr)]
+        }
+        # Mid-function speculative addresses use the existing entry_ switch and
+        # local-label mechanism.  A small wrapper per address calls the owning
+        # grouped body, preserving intra-routine gotos and 68000 loops.
+        for addr in self._speculative:
+            owner = self.part.func_of(addr)
+            if addr != owner:
+                self.part.functions[owner].extra_entries.add(addr)
         # Rejected entries (speculative-scope with invalid opcodes): populated in
         # emit_source before the second pass; _transfer skips direct calls to
         # rejected functions.
         self._rejected: set = set()
         self._build_fn_names(self._names)
+        self._build_speculative_fn_names()
         self._build_label_names(self._names)
 
     def _build_fn_names(self, names):
@@ -121,7 +203,7 @@ class Generator:
     def _build_label_names(self, names):
         """Map goto / mid-entry targets to C++ label identifiers."""
         self._labelname = {}
-        used = set(self._fnname.values()) | _RESERVED
+        used = set(self._fnname.values()) | set(self._spec_fnname.values()) | _RESERVED
         label_addrs = set(self.part.goto_labels)
         for func in self.part.functions.values():
             label_addrs |= func.extra_entries
@@ -134,6 +216,25 @@ class Generator:
             used.add(ident)
             self._labelname[addr] = ident
 
+    def _build_speculative_fn_names(self):
+        """Name the lightweight functions for speculative mid-entries.
+
+        Base entries already have a normal generated function.  Every other
+        speculative instruction gets a ``sub_AAAAAA`` wrapper unless that name
+        was claimed by a labelled base function, in which case use an explicit
+        ``spec_entry_AAAAAA`` fallback.
+        """
+        self._spec_fnname = {}
+        used = set(self._fnname.values()) | _RESERVED
+        for addr in sorted(self._speculative):
+            if addr in self.part.functions:
+                continue
+            ident = _fn(addr)
+            if ident in used:
+                ident = f'spec_entry_{addr:06x}'
+            used.add(ident)
+            self._spec_fnname[addr] = ident
+
     def fn(self, entry):
         """C++ function name for a function entry address."""
         return self._fnname.get(entry, _fn(entry))
@@ -141,6 +242,12 @@ class Generator:
     def label(self, addr):
         """C++ label for an intra-function branch target."""
         return self._labelname.get(addr, _default_label(addr))
+
+    def speculative_fn(self, addr):
+        """C++ callable entry for a speculative instruction address."""
+        if addr in self.part.functions:
+            return self.fn(addr)
+        return self._spec_fnname[addr]
 
     # -- control-flow lowering ------------------------------------------------
 
@@ -436,8 +543,15 @@ class Generator:
             out.append('    }')
         else:
             out.append('    (void)entry_;')
-        for addr in addrs:
+        falls_through = (FlowType.SEQUENTIAL, FlowType.CONDITIONAL, FlowType.CALL)
+        for index, addr in enumerate(addrs):
             out += [f'    {ln}' for ln in self._emit_instr(self.ins[addr])]
+            instr = self.ins[addr]
+            next_emitted = addrs[index + 1] if index + 1 < len(addrs) else None
+            if (next_emitted is not None and instr.flow in falls_through
+                    and instr.next_address != next_emitted):
+                out += [f'    {ln}' for ln in self._transfer(
+                    addr, instr.next_address)]
         # A function whose last instruction falls through (no RTS/RTE/BRA/JMP)
         # is hand-optimized 68000 code sharing a tail with whatever comes next
         # in ROM order — real hardware just keeps executing into it. Tail-call
@@ -445,13 +559,22 @@ class Generator:
         # pushed return address gets popped by *that* function's eventual
         # rts/rte rather than leaking 4 bytes off the emulated 68k stack.
         last = self.ins[addrs[-1]]
-        if last.flow in (FlowType.SEQUENTIAL, FlowType.CONDITIONAL, FlowType.CALL) \
+        if last.flow in falls_through \
                 and last.next_address in self.ins:
-            out += [f'    {ln}' for ln in self._transfer(func.addrs[-1], last.next_address)]
+            out += [f'    {ln}' for ln in self._transfer(addrs[-1], last.next_address)]
         else:
             out.append('    return;')
         out.append('}')
         return out
+
+    def _emit_speculative_wrapper(self, addr):
+        """Emit one exact-address entry function without duplicating its body."""
+        owner = self.part.func_of(addr)
+        return '\n'.join([
+            f'void Sor::{self.speculative_fn(addr)}() {{',
+            f'    {self.fn(owner)}({ea._hex(addr)});',
+            '}',
+        ])
 
 
     # -- whole-program emission ----------------------------------------------
@@ -459,6 +582,10 @@ class Generator:
     def emit_header(self):
         decls = [f'    void {self.fn(e)}(m_long entry_ = {ea._hex(e)});'
                  for e in self.part.entries if e not in self._rejected]
+        decls += [f'    void {self.speculative_fn(addr)}();'
+                  for addr in sorted(self._speculative)
+                  if addr not in self.part.functions
+                  and self.part.func_of(addr) not in self._rejected]
         return _HEADER_TEMPLATE.format(decls='\n'.join(decls))
 
     def emit_source(self):
@@ -499,12 +626,15 @@ class Generator:
                   if e not in rejected and e not in self._manual_functions}
 
         disp = ['void Sor::dispatch(m_long addr) {', '    switch (addr) {']
-        for e in self.part.entries:
-            if e not in rejected:
+        dispatch_entries = sorted(set(self.part.entries) | self._speculative)
+        for e in dispatch_entries:
+            owner = self.part.func_of(e)
+            if owner not in rejected:
                 if e in self._speculative:
                     disp.append(
                         f'        case {ea._hex(e)}: '
-                        f'confirmSpeculative({ea._hex(e)}); {self.fn(e)}(); return;')
+                        f'confirmSpeculative({ea._hex(e)}); '
+                        f'{self.speculative_fn(e)}(); return;')
                 else:
                     disp.append(f'        case {ea._hex(e)}: {self.fn(e)}(); return;')
         disp += ['        default: unhandledDispatch(addr); return;', '    }', '}']
@@ -513,6 +643,11 @@ class Generator:
         for e in self.part.entries:
             if e not in rejected and e not in self._manual_functions:
                 parts.append(bodies[e])
+
+        for addr in sorted(self._speculative):
+            owner = self.part.func_of(addr)
+            if addr not in self.part.functions and owner not in rejected:
+                parts.append(self._emit_speculative_wrapper(addr))
 
         return '\n\n'.join(parts) + '\n'
 
@@ -544,7 +679,7 @@ class Sor : public MegaDriveEnvironment {{
     // invoked before an instruction when an unmasked IRQ is pending.
     void serviceIRQ();
 
-    // One method per recompiled subroutine entry.
+    // Recompiled subroutines plus exact speculative instruction entries.
 {decls}
 }};
 '''

@@ -116,7 +116,7 @@ Arguments and options:
 | `<rom>` | Yes | | Path to the ROM binary. |
 | `-o, --out-dir <dir>` | No | `src/generated` | Directory where `Sor.hpp` and `Sor.cpp` are written. |
 | `--aux <file>` | No | `code-analysis/aux_addresses.txt` | Known auxiliary entry points. |
-| `--speculative <file>` | No | empty | Speculative entry points to compile with confirmation hooks. |
+| `--speculative <file>` | No | empty | Speculative candidates whose decoded instructions are all compiled as exact entries with confirmation hooks. |
 | `--labels-csv <file>` | No | `code-analysis/labels.csv` | CSV of code segment names. |
 | `--addresses-csv <file>` | No | `code-analysis/addresses.csv` | CSV of address labels. |
 | `-v, --verbose` | No | | Print more information during recompilation. |
@@ -126,6 +126,17 @@ Notes:
 
 - The generated `Sor.cpp` is self-contained; it emits small one-line cast macros and all 68000 instruction semantics directly.
 - If `--speculative` is not provided, no `confirmSpeculative` hooks are emitted.
+- Each valid instruction reached only from a speculative candidate gets its own
+  lightweight C++ entry function. The recompiler also validates every aligned
+  address inside the candidate's byte range, covering alternative overlapping
+  decodes such as an entry between two instructions of the primary stream. An
+  indirect call may therefore land in the middle of the candidate routine; the
+  exact address is confirmed and promoted instead of the scanner's estimated
+  function start.
+- Discovery builds also expose every baseline instruction boundary that is not
+  already a function entry. This covers indirect calls into the middle of known
+  code, which speculative scanning cannot find because the bytes are already
+  mapped as code.
 - If the recompiler finds an unsupported instruction outside the speculative scope, it fails instead of generating a silent stub.
 
 ## speculative-scan

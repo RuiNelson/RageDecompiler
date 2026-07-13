@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import os
+import re
 import subprocess
 import sys
 
@@ -12,7 +13,7 @@ from tools.recompiler import main as recompiler_main
 from tools.recompiler import opcodes
 from tools.recompiler.ea_codegen import TempPool
 from tools.recompiler.generator import Generator
-from tools.recompiler.main import _load_aux
+from tools.recompiler.main import _expand_speculative_entries, _load_aux
 from tools.recompiler.opcodes import Unsupported
 from tools.recompiler.regions import partition
 
@@ -350,11 +351,67 @@ def test_recompiler_default_emits_no_speculative_hooks(tmp_path):
 
 def test_recompiler_speculative_option_emits_speculative_hooks(tmp_path):
     out = tmp_path / 'discover'
+    aux = tmp_path / 'aux_without_012b94.txt'
+    aux.write_text('\n'.join(
+        line for line in
+        (_FIXTURE_ROOT / 'code-analysis/aux_addresses.txt').read_text().splitlines()
+        if line.split(';')[0].split('#')[0].strip().upper()
+        not in {'009214', '012B94'}
+    ) + '\n')
 
-    _run_recompiler(out, '--speculative', 'code-analysis/speculative_addresses.txt')
+    _run_recompiler(out, '--aux', str(aux),
+                    '--speculative', 'code-analysis/speculative_addresses.txt')
 
     source = (out / 'Sor.cpp').read_text()
-    assert 'confirmSpeculative(' in source
+    raw_candidates = _load_aux(
+        _FIXTURE_ROOT / 'code-analysis/speculative_addresses.txt')
+    # Every instruction reached only by the speculative phase is exposed, so
+    # there must be more exact-address hooks than scanner candidate starts.
+    assert source.count('confirmSpeculative(') > len(raw_candidates)
+    # Mid-instruction entries are real lightweight functions which forward to
+    # their grouped owner with the precise 68000 address.
+    assert 'void Sor::sub_0003be() {' in source
+    assert 'sub_0003ba(0x03BEu);' in source
+    assert ('case 0x00012B94u: confirmSpeculative(0x00012B94u); '
+            'sub_012b94(); return;') in source
+    assert 'void Sor::sub_012b94() {' in source
+    # $009214 is already baseline code but not a baseline function entry. It
+    # must still be exposed and confirmed during discovery so a mid-function
+    # indirect call does not force exit 42 and a rebuild.
+    assert ('case 0x9214u: confirmSpeculative(0x9214u); '
+            'sub_009214(); return;') in source
+    assert 'void Sor::sub_009214() {' in source
+    goto_targets = set(re.findall(r'\bgoto ([A-Za-z_][A-Za-z0-9_]*);', source))
+    defined_labels = set(re.findall(
+        r'^\s*([A-Za-z_][A-Za-z0-9_]*):$', source, flags=re.MULTILINE))
+    assert goto_targets <= defined_labels
+
+
+def test_speculative_expansion_validates_overlapping_aligned_entries():
+    # $200: move.l ($4E71).w,d0 ; $204: rts is the primary stream.
+    # $202: nop ; $204: rts is a second valid aligned entry stream inside it.
+    rom_data = bytearray(ROM.END + 1)
+    rom_data[0x200:0x206] = b'\x20\x38\x4E\x71\x4E\x75'
+    rom = ROM(bytes(rom_data))
+
+    class EmptyBaseline:
+        instructions = {}
+        subroutines = set()
+        labels = set()
+
+    assert _expand_speculative_entries(
+        rom, EmptyBaseline(), {0x200}) == {0x200, 0x202, 0x204}
+
+
+def test_real_012b7a_candidate_expands_to_012b94():
+    rom = ROM.from_file(str(_FIXTURE_ROOT / 'rom/SOR.bin'))
+    seeds = set(_load_aux(_FIXTURE_ROOT / 'code-analysis/aux_addresses.txt'))
+    seeds.discard(0x012B94)
+    baseline, _ = recompiler_main._disassemble_to_fixpoint(rom, seeds)
+
+    expanded = _expand_speculative_entries(rom, baseline, {0x012B7A})
+
+    assert 0x012B94 in expanded
 
 
 def test_disassemble_to_fixpoint_repeats_after_new_table_targets(monkeypatch):
@@ -423,6 +480,88 @@ def test_speculative_scope_does_not_confirm_derived_entries():
             'sub_000200(); return;') in src
     assert 'confirmSpeculative(0x0200u);' not in _function_source(src, 'sub_000200')
     assert 'confirmSpeculative(0x0300u);' not in src
+
+
+def test_every_speculative_instruction_has_an_exact_entry_function():
+    ins = {
+        0x100: _instr('rts', None, [], FlowType.RETURN),
+        0x200: _instr('nop', None, []),
+        0x202: _instr('nop', None, []),
+        0x204: _instr('rts', None, [], FlowType.RETURN),
+    }
+    for address in ins:
+        ins[address].address = address
+
+    gen = Generator(ins, {0x100, 0x200},
+                    speculative_addrs={0x200, 0x202, 0x204},
+                    speculative_scope={0x200},
+                    baseline_instrs={0x100})
+    source = gen.emit_source()
+    header = gen.emit_header()
+
+    assert ('case 0x0200u: confirmSpeculative(0x0200u); '
+            'sub_000200(); return;') in source
+    assert ('case 0x0202u: confirmSpeculative(0x0202u); '
+            'sub_000202(); return;') in source
+    assert ('case 0x0204u: confirmSpeculative(0x0204u); '
+            'sub_000204(); return;') in source
+    assert 'void Sor::sub_000202() {\n    sub_000200(0x0202u);\n}' in source
+    assert 'void Sor::sub_000204() {\n    sub_000200(0x0204u);\n}' in source
+    assert 'case 0x0202u: goto L000202;' in _function_source(source, 'sub_000200')
+    assert 'case 0x0204u: goto L000204;' in _function_source(source, 'sub_000200')
+    assert 'void sub_000202();' in header
+    assert 'void sub_000204();' in header
+
+
+def test_baseline_mid_instruction_is_confirmable_in_discovery():
+    ins = {
+        0x100: _instr('nop', None, []),
+        0x102: _instr('rts', None, [], FlowType.RETURN),
+    }
+    for address in ins:
+        ins[address].address = address
+
+    gen = Generator(ins, {0x100}, speculative_addrs=set(),
+                    speculative_scope=set(), baseline_instrs=set(ins),
+                    confirm_addrs={0x102})
+    source = gen.emit_source()
+
+    assert gen.part.func_of(0x102) == 0x100
+    assert ('case 0x0102u: confirmSpeculative(0x0102u); '
+            'sub_000102(); return;') in source
+    assert 'void Sor::sub_000102() {\n    sub_000100(0x0102u);\n}' in source
+
+
+def test_overlapping_speculative_flow_keeps_phase2_instruction_ownership():
+    """A baseline entry inside an overlapping speculative byte stream must not
+    steal and filter the later speculative instructions (the $014EAE case)."""
+    ins = {
+        0x100: _instr('nop', None, []),
+        0x102: _instr('rts', None, [], FlowType.RETURN),
+        0x104: _instr('nop', None, []),
+        0x106: _instr('rts', None, [], FlowType.RETURN),
+    }
+    ins[0x100].byte_length = 4  # speculative stream jumps over baseline $102
+    for address in ins:
+        ins[address].address = address
+
+    gen = Generator(ins, {0x100, 0x102},
+                    speculative_addrs={0x100, 0x104, 0x106},
+                    speculative_scope={0x100},
+                    baseline_instrs={0x102})
+    source = gen.emit_source()
+
+    assert gen.part.func_of(0x104) == 0x100
+    assert gen.part.func_of(0x106) == 0x100
+    assert ('case 0x0104u: confirmSpeculative(0x0104u); '
+            'sub_000104(); return;') in source
+    assert ('case 0x0106u: confirmSpeculative(0x0106u); '
+            'sub_000106(); return;') in source
+    owner = _function_source(source, 'sub_000100')
+    assert 'case 0x0104u: goto L000104;' in owner
+    assert 'case 0x0106u: goto L000106;' in owner
+    assert '// $000104 nop' in owner
+    assert '// $000106 rts' in owner
 
 
 def test_invalid_speculative_derived_entry_is_rejected_not_fatal():

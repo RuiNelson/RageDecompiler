@@ -387,6 +387,53 @@ def _load_aux(path):
     return parse_address_lines(path, code_only=True, warn_prefix='[recompile]')
 
 
+def _expand_speculative_entries(rom, baseline_disasm, candidates) -> set:
+    """Return every valid aligned entry inside each speculative candidate run.
+
+    ``speculative_scan`` deliberately records one address per plausible routine.
+    An indirect call can nevertheless land at another word-aligned decode inside
+    that byte range.  For example, the primary stream has an instruction at
+    $012B92 whose next address is $012B96, while $012B94 is also a valid entry
+    with a different overlapping decode.  Validate every even address up to the
+    candidate's straight-line terminator so discovery compiles both streams.
+    """
+    candidates = set(candidates or [])
+    if not candidates:
+        return set()
+
+    # Lazy import avoids a module-import cycle: speculative_scan uses the
+    # recompiler's fixpoint table discovery, while the CLI needs its validator
+    # only after both modules have been loaded.
+    from tools.disassembler.rom_map import RomMap
+    from tools.speculative_scan.main import Validator
+
+    rom_map = RomMap(rom.size, baseline_disasm.instructions,
+                     baseline_disasm.subroutines,
+                     baseline_disasm.labels).format()
+    validator = Validator(rom, rom_map)
+    baseline_boundaries = frozenset(ord(c) for c in 'SsLC')
+    entries = set()
+    for start in sorted(candidates):
+        if not rom.in_bounds(start, 2) or (start & 1):
+            continue
+        if not validator.terminates(start):
+            continue
+        stop = validator.run_end(start)
+        if stop <= start:
+            stop = start + 2
+        for addr in range(start, stop, 2):
+            if not rom.in_bounds(addr, 2):
+                break
+            # A known instruction boundary already has a baseline dispatch
+            # owner. Continuation bytes and unknown bytes remain valid alternate
+            # speculative starts and must be checked.
+            if rom_map[addr] in baseline_boundaries:
+                continue
+            if validator.terminates(addr):
+                entries.add(addr)
+    return entries
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description='Recompile the SoR ROM to C++.')
     ap.add_argument('rom', help='path to the ROM binary')
@@ -396,10 +443,12 @@ def main(argv=None):
                     help='auxiliary entry-point address file: indirect-jump '
                          'targets from the active disassembly (optional)')
     ap.add_argument('--speculative', default='',
-                    help='speculative entry-point file: compiled like aux but '
-                         'confirm indirect dispatches to those addresses so the '
-                         'runtime can promote confirmed ones to the aux file. '
-                         'Disabled unless this option is provided.')
+                    help='speculative candidate file: compile every valid '
+                         'aligned address in those candidate ranges as an exact '
+                         'entry; '
+                         'confirm indirect dispatches so the runtime can promote '
+                         'the actual target to the aux file. Disabled unless '
+                         'this option is provided.')
     ap.add_argument('--labels-csv', default='code-analysis/labels.csv',
                     help='CSV of code-segment names (address,label,comment)')
     ap.add_argument('--addresses-csv', default='code-analysis/addresses.csv',
@@ -422,18 +471,39 @@ def main(argv=None):
     # The _transfer fix (addrs_set check) ensures that speculative entries which
     # straddle baseline-instruction ranges don't generate invalid cross-fn gotos.
     speculative_raw = set(_load_aux(args.speculative)) - seeds  # skip already-known
-    if speculative_raw:
+    speculative_decode_entries = _expand_speculative_entries(
+        rom, disasm, speculative_raw) - seeds
+    if speculative_decode_entries:
         disasm, seeds = _disassemble_to_fixpoint(
-            rom, seeds | speculative_raw, args.verbose)
-    speculative_derived = set(disasm.subroutines) - baseline_entries
-    # Only raw seeds are promoted by dispatch confirmation. Derived entries are
-    # reached through normal generated control flow once the seed is promoted.
-    speculative_seeds = speculative_raw & speculative_derived
+            rom, seeds | speculative_decode_entries, args.verbose)
+    # The aligned alternatives are decode seeds, not separate body owners. Keep
+    # the scanner's original starts (plus genuinely derived call/table targets)
+    # as generated function roots; exact alternatives become lightweight entry
+    # wrappers into those grouped bodies.
+    alternate_decode_seeds = speculative_decode_entries - speculative_raw
+    generated_subroutines = set(disasm.subroutines) - alternate_decode_seeds
+    speculative_derived = generated_subroutines - baseline_entries
+    # Every instruction decoded only after adding the speculative seeds is a
+    # possible run-time entry.  Function-pointer tables are allowed to point
+    # into the middle of a routine, not just at the candidate start selected by
+    # speculative_scan, so expose every one of these instruction boundaries to
+    # dispatch.  Generator keeps their bodies grouped and emits lightweight
+    # entry wrappers, avoiding code duplication and recursive native calls for
+    # 68000 loops.
+    speculative_entries = set(disasm.instructions) - baseline_instrs
+    # Discovery must also cover indirect calls into the middle of code already
+    # decoded by the baseline pass. Those addresses are not speculative code and
+    # therefore can never be found by speculative_scan, but they still need an
+    # exact dispatch wrapper so the active run can confirm them without exit 42.
+    confirm_entries = (set(disasm.instructions) - baseline_entries
+                       if args.speculative else set())
 
     if args.verbose:
         print(f'[recompile] {len(seeds)} seed addresses, '
+              f'{len(speculative_decode_entries)} speculative decode entries, '
               f'{len(speculative_derived)} speculative-derived entries, '
-              f'{len(speculative_seeds)} seeds needing confirmation',
+              f'{len(speculative_entries)} speculative instruction entries, '
+              f'{len(confirm_entries)} confirmable exact entries',
               file=sys.stderr)
 
     # Function names and intra-function goto labels: code-segment labels
@@ -452,12 +522,13 @@ def main(argv=None):
         formatted = ', '.join(f'${address:06X}' for address in sorted(unknown_manual))
         ap.error(f'manual function address(es) are not subroutine entries: {formatted}')
 
-    gen = Generator(disasm.instructions, disasm.subroutines,
+    gen = Generator(disasm.instructions, generated_subroutines,
                     rom_path=args.rom, names=names,
-                    speculative_addrs=speculative_seeds,
+                    speculative_addrs=speculative_entries,
                     speculative_scope=speculative_derived,
                     baseline_instrs=baseline_instrs,
-                    manual_functions=manual_functions)
+                    manual_functions=manual_functions,
+                    confirm_addrs=confirm_entries)
     source = gen.emit_source()   # must run first — populates self._rejected
     header = gen.emit_header()
 

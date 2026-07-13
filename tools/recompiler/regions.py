@@ -34,9 +34,12 @@ class Partition:
     entries:     list          # sorted entry addresses
     goto_labels: set           # addresses reached by an intra-function goto
     instructions: dict         # {addr: Instruction}
+    owners:       dict          # exact instruction addr -> owning function entry
 
     def func_of(self, addr: int) -> int:
         """Entry address of the function that owns ``addr`` (or None)."""
+        if addr in self.owners:
+            return self.owners[addr]
         i = bisect.bisect_right(self.entries, addr) - 1
         return self.entries[i] if i >= 0 else None
 
@@ -48,13 +51,15 @@ class Partition:
         return f is not None and addr in f.extra_entries
 
 
-def partition(instructions: dict, subroutines: set) -> Partition:
+def partition(instructions: dict, subroutines: set,
+              owner_overrides: dict | None = None) -> Partition:
     """Build the function partition from decoded instructions.
 
     ``subroutines`` are the disassembler's identified entries (reset/IRQ seeds,
     aux addresses, and JSR/BSR targets). Any decoded instruction is also a
     fall-back entry boundary only through those; everything else is owned by the
-    nearest preceding entry.
+    nearest preceding entry unless ``owner_overrides`` assigns it to an
+    overlapping speculative flow.
     """
     # Entries: known subroutines that actually decoded, always including the
     # lowest decoded address so every instruction is owned.
@@ -63,24 +68,45 @@ def partition(instructions: dict, subroutines: set) -> Partition:
         entries = sorted(set(entries) | {min(instructions)})
 
     functions = {e: Function(entry=e) for e in entries}
+    owner_overrides = owner_overrides or {}
+    owners = {}
     for addr in sorted(instructions):
-        i = bisect.bisect_right(entries, addr) - 1
-        functions[entries[i]].addrs.append(addr)
+        owner = owner_overrides.get(addr)
+        if owner not in functions:
+            i = bisect.bisect_right(entries, addr) - 1
+            owner = entries[i]
+        functions[owner].addrs.append(addr)
+        owners[addr] = owner
 
     part = Partition(functions=functions, entries=entries,
-                     goto_labels=set(), instructions=instructions)
+                     goto_labels=set(), instructions=instructions,
+                     owners=owners)
+    next_owned = {}
+    for function in functions.values():
+        next_owned.update(zip(function.addrs, function.addrs[1:]))
 
-    # Classify every static transfer to populate goto labels and mid-entries.
+    # Classify explicit transfers and implicit fall-through edges.  Fall-through
+    # normally remains inside one numeric function, but ownership overrides for
+    # overlapping speculative decodes can make it cross into another body.
     for addr, instr in instructions.items():
-        if instr.flow not in (FlowType.BRANCH, FlowType.CONDITIONAL):
-            continue
         fsrc = part.func_of(addr)
-        for tgt in instr.targets:
+        explicit = list(instr.targets) if instr.flow in (
+            FlowType.BRANCH, FlowType.CONDITIONAL, FlowType.CALL) else []
+        fallthrough = [instr.next_address] if instr.flow in (
+            FlowType.SEQUENTIAL, FlowType.CONDITIONAL, FlowType.CALL) else []
+        for tgt in explicit + fallthrough:
             if tgt not in instructions:
                 continue
             ftgt = part.func_of(tgt)
             if ftgt == fsrc:
-                part.goto_labels.add(tgt)            # intra-function goto
+                if tgt in explicit and instr.flow in (
+                        FlowType.BRANCH, FlowType.CONDITIONAL):
+                    part.goto_labels.add(tgt)        # intra-function goto
+                elif tgt in fallthrough and next_owned.get(addr) != tgt:
+                    # The same logical body resumes after an interleaved
+                    # overlapping decode; codegen emits an explicit goto over
+                    # the other body's numerically adjacent instructions.
+                    part.goto_labels.add(tgt)
             elif tgt != ftgt:
                 functions[ftgt].extra_entries.add(tgt)  # mid-function entry
 
