@@ -1,4 +1,4 @@
-"""CLI: recompile the ROM into a Sor.hpp / Sor.cpp MegaDriveEnvironment subclass.
+"""CLI: recompile the ROM into a Sor.hpp / Sor.cpp RecompilationEnvironment subclass.
 
     python3 -m tools.recompiler rom/StreetsOfRage.bin -o src/generated [--aux aux_addresses.txt]
 

@@ -1,7 +1,7 @@
 """Static 68000 → C++ recompiler for Streets of Rage.
 
 Consumes the disassembler's structured ``Instruction`` / ``EA`` stream (see
-``tools/disassembler/instruction.py``) and emits a ``MegaDriveEnvironment``
+``tools/disassembler/instruction.py``) and emits a ``RecompilationEnvironment``
 subclass whose ``run()`` is the recompiled cartridge code.
 
 Pipeline
