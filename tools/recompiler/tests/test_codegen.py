@@ -282,7 +282,7 @@ def test_scc_sets_byte_by_condition():
     out = '\n'.join(opcodes.emit_dataop(_instr(
         'sne', 'b', [EA(EAMode.DATA_REG, reg=6)])))
     assert 'BYTE(0xFF)' in out and 'BYTE(0)' in out
-    assert 'cpu().condition(6)' in out
+    assert 'cpu().ne()' in out
     assert 'cpu().setDb(6,' in out
 
 
@@ -327,14 +327,15 @@ def test_irq_check_emitted_before_each_instruction():
     assert '#define BEFORE_INSTRUCTION if (irqLevel() > cpu().interruptMask()) serviceIRQ(); pace();' in src
     assert src.count('BEFORE_INSTRUCTION') == 3
     assert '(void)0;' in src
-    assert 'cpu().ssp += 4;' in src
+    assert 'RETURN_68K()' in src
     assert 'void Sor::serviceIRQ()' in src
     assert '#define BYTE(v) static_cast<m_byte>(v)' in src
     assert '#define F_Z' not in src
     assert 'cpu().enterInterrupt(level);' in src
     assert '#include "M68KMacros.hpp"' not in src
     assert '#define traceEnter(addr) ((void)0)' in src
-    assert '#ifdef SOR_TRACE' in src
+    assert '#define CALL(' in src
+    assert '#define RETURN_68K()' in src
 
 
 def test_every_instruction_uses_a_brace_block():
@@ -397,7 +398,7 @@ def test_live_flags_kept_before_conditional_branch():
     src = Generator(ins, {0x100}).emit_source()
     body = _function_source(src, 'sub_000100')
     assert 'setNZClearVC' in body
-    assert 'condition(7)' in body
+    assert 'cpu().eq()' in body
 
 
 def test_dead_cmp_omitted_entirely():
@@ -444,6 +445,14 @@ def test_ccr_effects_move_vs_beq():
     assert ccr.effects(beq) == (frozenset({ccr.Z}), frozenset())
 
 
+def test_named_conditions_and_call_macros_in_source():
+    from tools.recompiler import cpp_semantics as sem
+    assert sem.cc_expr(7) == 'cpu().eq()'
+    assert sem.cc_expr(6) == 'cpu().ne()'
+    assert 'CALL(' in sem.CAST_MACROS
+    assert 'RETURN_68K()' in sem.CAST_MACROS
+
+
 def test_jsr_emits_nonlocal_return_guard():
     ins = {
         0x100: _instr('jsr', None, [], FlowType.CALL),
@@ -457,9 +466,8 @@ def test_jsr_emits_nonlocal_return_guard():
 
     src = Generator(ins, {0x100, 0x200}).emit_source()
 
-    assert 'm_long sp_000100 = cpu().ssp;' in src
-    assert 'memory().writeLong(cpu().ssp, LONG(0x0106u));' in src
-    assert 'if ((cpu().ssp & 0x00FFFFFFu) > (sp_000100 & 0x00FFFFFFu)) return;' in src
+    assert 'CALL(' in src and '0x0106u' in src
+    assert '#define CALL(' in src
 
 
 def test_partition_assigns_to_nearest_entry():
@@ -768,5 +776,5 @@ def test_manual_function_keeps_declaration_calls_and_dispatch_but_omits_body():
 
     assert 'void manual_wait(m_long entry_ = 0x0200u);' in header
     assert 'case 0x0200u: manual_wait(); return;' in source
-    assert 'manual_wait();' in _function_source(source, 'sub_000100')
+    assert 'CALL(manual_wait,' in _function_source(source, 'sub_000100')
     assert 'void Sor::manual_wait(' not in source

@@ -22,6 +22,41 @@ CAST_MACROS = r'''
 #define SEX_W(v) static_cast<m_long>(static_cast<int32_t>(static_cast<int16_t>(v)))
 #define SEX_B(v) static_cast<m_long>(static_cast<int32_t>(static_cast<int8_t>(v)))
 #define BEFORE_INSTRUCTION if (irqLevel() > cpu().interruptMask()) serviceIRQ(); pace();
+// Emulated 68000 subroutine call/return (native C++ call + soft stack).
+#define CALL(fn, ret_pc) do { \
+    m_long _call_sp = cpu().ssp; \
+    cpu().ssp -= 4; \
+    memory().writeLong(cpu().ssp, LONG(ret_pc)); \
+    (fn)(); \
+    if ((cpu().ssp & 0x00FFFFFFu) > (_call_sp & 0x00FFFFFFu)) return; \
+} while (0)
+#define CALL_ENTRY(fn, entry, ret_pc) do { \
+    m_long _call_sp = cpu().ssp; \
+    cpu().ssp -= 4; \
+    memory().writeLong(cpu().ssp, LONG(ret_pc)); \
+    (fn)(entry); \
+    if ((cpu().ssp & 0x00FFFFFFu) > (_call_sp & 0x00FFFFFFu)) return; \
+} while (0)
+#define CALL_DISPATCH(addr, ret_pc) do { \
+    m_long _call_sp = cpu().ssp; \
+    cpu().ssp -= 4; \
+    memory().writeLong(cpu().ssp, LONG(ret_pc)); \
+    dispatch(addr); \
+    if ((cpu().ssp & 0x00FFFFFFu) > (_call_sp & 0x00FFFFFFu)) return; \
+} while (0)
+#ifdef SOR_TRACE
+#define RETURN_68K() do { \
+    cpu().ssp += 4; \
+    if ((cpu().ssp & 0x00FFFFFFu) > 0x00FFFF00u) { \
+        std::fprintf(stderr, "[RTS] ssp=$%06X fn=$%06X\n", \
+                     static_cast<unsigned>(cpu().ssp & 0x00FFFFFFu), \
+                     static_cast<unsigned>(lastFunction() & 0x00FFFFFFu)); \
+    } \
+    return; \
+} while (0)
+#else
+#define RETURN_68K() do { cpu().ssp += 4; return; } while (0)
+#endif
 // Diagnostic only: define SOR_TRACE when building to enable entry/RTS logging.
 #ifndef SOR_TRACE
 #define traceEnter(addr) ((void)0)
@@ -87,8 +122,16 @@ def int_level() -> str:
     return 'cpu().interruptMask()'
 
 
+# Named CPU68K condition helpers (see CPU68K::eq/ne/…); index = 68000 cc field.
+_CC_METHOD = (
+    'ccTrue', 'ccFalse', 'hi', 'ls', 'cc', 'cs', 'ne', 'eq',
+    'vc', 'vs', 'pl', 'mi', 'ge', 'lt', 'gt', 'le',
+)
+
+
 def cc_expr(cc: int) -> str:
-    return f'cpu().condition({cc})'
+    """C++ boolean expression for a 68000 condition-code number."""
+    return f'cpu().{_CC_METHOD[cc & 0x0F]}()'
 
 
 def set_nzvc(value: str, size: str, v: str = 'false', c: str = 'false',

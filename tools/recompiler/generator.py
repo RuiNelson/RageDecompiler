@@ -299,39 +299,28 @@ class Generator:
             return self._transfer(a, instr.targets[0])
 
         if m in ('bsr', 'jsr'):
-            call_sp = f'sp_{a:06x}'
-            push = [f'm_long {call_sp} = cpu().ssp;',
-                    f'cpu().ssp -= 4;',
-                    f'memory().writeLong(cpu().ssp, LONG({ea._hex(nxt)}));']
-            check_nonlocal_return = [
-                f'if ((cpu().ssp & 0x00FFFFFFu) > ({call_sp} & 0x00FFFFFFu)) return;'
-            ]
+            ret = ea._hex(nxt)
             if m == 'jsr' and (instr.indirect or not instr.targets):
                 setup, addr = self._jump_address(instr)
-                return push + setup + [f'traceEnter({ea._hex(a)});',
-                                       f'dispatch({addr});'] + check_nonlocal_return
+                # Indirect: evaluate EA then CALL_DISPATCH.
+                return setup + [
+                    f'traceEnter({ea._hex(a)});',
+                    f'CALL_DISPATCH({addr}, {ret});',
+                ]
             tgt = instr.targets[0]
             if tgt in self.ins:
                 owner = self.part.func_of(tgt)
                 if owner not in self._rejected:
                     if owner == tgt:
-                        return push + [f'{self.fn(owner)}();'] + check_nonlocal_return
-                    return push + [f'{self.fn(owner)}({ea._hex(tgt)});'] + check_nonlocal_return
-            return push + [f'traceEnter({ea._hex(a)});',
-                           f'dispatch({ea._hex(tgt)});'] + check_nonlocal_return
+                        return [f'CALL({self.fn(owner)}, {ret});']
+                    return [f'CALL_ENTRY({self.fn(owner)}, {ea._hex(tgt)}, {ret});']
+            return [
+                f'traceEnter({ea._hex(a)});',
+                f'CALL_DISPATCH({ea._hex(tgt)}, {ret});',
+            ]
 
         if m == 'rts':
-            return [
-                'cpu().ssp += 4;',
-                '#ifdef SOR_TRACE',
-                'if ((cpu().ssp & 0x00FFFFFFu) > 0x00FFFF00u) {',
-                '    std::fprintf(stderr, "[RTS] ssp=$%06X fn=$%06X\\n",',
-                '                 static_cast<unsigned>(cpu().ssp & 0x00FFFFFFu),',
-                '                 static_cast<unsigned>(lastFunction() & 0x00FFFFFFu));',
-                '}',
-                '#endif',
-                'return;',
-            ]
+            return ['RETURN_68K();']
 
         if m == 'rte':
             return ['cpu().setStatus(memory().readWord(cpu().ssp));',
@@ -349,7 +338,8 @@ class Generator:
             reg = instr.eas[0].reg
             body = self._transfer(a, instr.targets[0])
             ctr = f'dbcc_{a:06x}'
-            return [f'if (!({sem.cc_expr(cc)})) {{',
+            # DBcc: if condition false, decrement and maybe branch.
+            return [f'if (!{sem.cc_expr(cc)}) {{',
                     f'    m_word {ctr} = WORD((cpu().dw({reg}) - 1) & 0xFFFFu);',
                     f'    cpu().setDw({reg}, {ctr});',
                     f'    if ({ctr} != 0xFFFFu) {{'] + \
