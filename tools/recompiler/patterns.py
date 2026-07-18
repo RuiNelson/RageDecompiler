@@ -560,13 +560,15 @@ def _emit_imm_disp_store_chain(m: PatternHit, live_out: dict) -> list[str]:
         addr = m.addrs[i]
         imm_hex = ea._hex(imm & mask[size])
         # Re-read An after every BEFORE (IRQ may change it).
-        out.append(f'// ${addr:06X} move.{size} #{imm & mask[size]:X}, '
-                   f'{disp}(a{an})')
-        out.append('BEFORE_INSTRUCTION')
-        out.append(
-            f'memory().{write[size]}(({ar} + {disp}), {cast[size]}({imm_hex}));')
-        out.extend(sem.move(f'{cast[size]}({imm_hex})', size,
-                            live=_live_at(live_out, addr)))
+        _step(out, [
+            f'// ${addr:06X} move.{size} #{imm & mask[size]:X}, '
+            f'{disp}(a{an})',
+            'BEFORE_INSTRUCTION',
+            f'memory().{write[size]}(({ar} + {disp}), '
+            f'{cast[size]}({imm_hex}));',
+            *sem.move(f'{cast[size]}({imm_hex})', size,
+                      live=_live_at(live_out, addr)),
+        ])
     return out
 
 
@@ -606,16 +608,26 @@ def _match_moveq_chain(instrs, min_n: int = 2):
     return n, {'ops': ops}
 
 
+def _step(out: list[str], lines: list[str]) -> None:
+    """Emit one original-opcode step in its own C++ scope (unique temps)."""
+    out.append('{')
+    for ln in lines:
+        out.append(f'    {ln}')
+    out.append('}')
+
+
 def _emit_moveq_chain(m: PatternHit, live_out: dict) -> list[str]:
     """Custom C++: consecutive moveq — common multi-register prologue."""
     out: list[str] = []
     for i, (dn, imm) in enumerate(m.data['ops']):
         addr = m.addrs[i]
         val = _moveq_imm_long(imm)
-        out.append(f'// ${addr:06X} moveq #{imm:02X}, d{dn}')
-        out.append('BEFORE_INSTRUCTION')
-        out.append(ea.write_dn(dn, 'l', val))
-        out.extend(sem.move(val, 'l', live=_live_at(live_out, addr)))
+        _step(out, [
+            f'// ${addr:06X} moveq #{imm:02X}, d{dn}',
+            'BEFORE_INSTRUCTION',
+            ea.write_dn(dn, 'l', val),
+            *sem.move(val, 'l', live=_live_at(live_out, addr)),
+        ])
     return out
 
 
@@ -682,12 +694,13 @@ def _emit_moveq_load_byte(m: PatternHit, live_out: dict) -> list[str]:
     dn = m.data['dn']
     imm_val = _moveq_imm_long(m.data['imm'])
     a0, a1 = m.addrs
-    out = [
+    out: list[str] = []
+    _step(out, [
         f'// ${a0:06X} moveq #{m.data["imm"]:02X}, d{dn}',
         'BEFORE_INSTRUCTION',
         ea.write_dn(dn, 'l', imm_val),
-    ]
-    out.extend(sem.move(imm_val, 'l', live=_live_at(live_out, a0)))
+        *sem.move(imm_val, 'l', live=_live_at(live_out, a0)),
+    ])
 
     mode = m.data['src_mode']
     if mode == 'disp':
@@ -696,7 +709,6 @@ def _emit_moveq_load_byte(m: PatternHit, live_out: dict) -> list[str]:
         comment = f'move.b {disp}(a{an}), d{dn}'
     elif mode == 'postinc':
         an = m.data['an']
-        step = ea.addr_step(an, 'b')
         src_expr = f'memory().readByte({_areg(an)})'
         comment = f'move.b (a{an})+, d{dn}'
     elif mode == 'ind':
@@ -708,14 +720,18 @@ def _emit_moveq_load_byte(m: PatternHit, live_out: dict) -> list[str]:
         src_expr = f'memory().readByte({abs_hex})'
         comment = f'move.b ({abs_hex}).w, d{dn}'
 
-    out.append(f'// ${a1:06X} {comment}')
-    out.append('BEFORE_INSTRUCTION')
-    # Materialise the byte so flags and Dn write share one read (post-IRQ).
-    out.append(f'm_byte t = {src_expr};')
+    step2 = [
+        f'// ${a1:06X} {comment}',
+        'BEFORE_INSTRUCTION',
+        # Materialise the byte so flags and Dn write share one read (post-IRQ).
+        f'm_byte t = {src_expr};',
+    ]
     if mode == 'postinc':
-        out.append(f'{_areg(m.data["an"])} += {ea.addr_step(m.data["an"], "b")};')
-    out.append(ea.write_dn(dn, 'b', 't'))
-    out.extend(sem.move('t', 'b', live=_live_at(live_out, a1)))
+        step2.append(
+            f'{_areg(m.data["an"])} += {ea.addr_step(m.data["an"], "b")};')
+    step2.append(ea.write_dn(dn, 'b', 't'))
+    step2.extend(sem.move('t', 'b', live=_live_at(live_out, a1)))
+    _step(out, step2)
     return out
 
 
@@ -749,15 +765,14 @@ def _emit_disp_word_copy_chain(m: PatternHit, live_out: dict) -> list[str]:
     out: list[str] = []
     for i, (as_, sd, ad, dd) in enumerate(m.data['copies']):
         addr = m.addrs[i]
-        out.append(
-            f'// ${addr:06X} move.w {sd}(a{as_}), {dd}(a{ad})')
-        out.append('BEFORE_INSTRUCTION')
-        # Re-read both bases after BEFORE — IRQ may change either An.
-        out.append(
-            f'm_word t = memory().readWord(({_areg(as_)} + {sd}));')
-        out.append(
-            f'memory().writeWord(({_areg(ad)} + {dd}), t);')
-        out.extend(sem.move('t', 'w', live=_live_at(live_out, addr)))
+        _step(out, [
+            f'// ${addr:06X} move.w {sd}(a{as_}), {dd}(a{ad})',
+            'BEFORE_INSTRUCTION',
+            # Re-read both bases after BEFORE — IRQ may change either An.
+            f'm_word t = memory().readWord(({_areg(as_)} + {sd}));',
+            f'memory().writeWord(({_areg(ad)} + {dd}), t);',
+            *sem.move('t', 'w', live=_live_at(live_out, addr)),
+        ])
     return out
 
 
@@ -808,16 +823,20 @@ def _emit_lea_abs_then_moveq(m: PatternHit, live_out: dict) -> list[str]:
     abs_hex = ea._hex(m.data['abs'])
     imm_val = _moveq_imm_long(m.data['imm'])
     a0, a1 = m.addrs
+    out: list[str] = []
     # lea does not touch CCR.
-    return [
+    _step(out, [
         f'// ${a0:06X} lea.l ({abs_hex}).{m.data["form"]}, a{an}',
         'BEFORE_INSTRUCTION',
         f'{_areg(an)} = {abs_hex};',
+    ])
+    _step(out, [
         f'// ${a1:06X} moveq #{m.data["imm"]:02X}, d{dn}',
         'BEFORE_INSTRUCTION',
         ea.write_dn(dn, 'l', imm_val),
         *sem.move(imm_val, 'l', live=_live_at(live_out, a1)),
-    ]
+    ])
+    return out
 
 
 register(Pattern(
@@ -851,21 +870,22 @@ def _emit_addw_self_chain(m: PatternHit, live_out: dict) -> list[str]:
     from tools.recompiler.ea_codegen import TempPool
 
     dn = m.data['dn']
-    n = m.n
     # Unrolled: each step re-reads Dn after BEFORE (IRQ-safe).  Using sem.add
-    # keeps V/C/X exactly as a single add.w Dn,Dn would.
+    # keeps V/C/X exactly as a single add.w Dn,Dn would.  Nested scopes keep
+    # TempPool names (t0/t1) unique per step.
     out: list[str] = []
     for i, addr in enumerate(m.addrs):
-        out.append(f'// ${addr:06X} add.w d{dn}, d{dn}')
-        out.append('BEFORE_INSTRUCTION')
         tmp = TempPool(addr)
-        # Operate on the word view; write back via setDw.
-        dw = f'_dw{i}'
-        out.append(f'm_word {dw} = {ea.read_dn(dn, "w")};')
+        dw = 'dw'
+        body = [
+            f'// ${addr:06X} add.w d{dn}, d{dn}',
+            'BEFORE_INSTRUCTION',
+            f'm_word {dw} = {ea.read_dn(dn, "w")};',
+        ]
         tmp.types[dw] = 'w'
-        body = sem.add(dw, dw, 'w', tmp, live=_live_at(live_out, addr))
-        out.extend(body)
-        out.append(ea.write_dn(dn, 'w', dw, tmp.types))
+        body.extend(sem.add(dw, dw, 'w', tmp, live=_live_at(live_out, addr)))
+        body.append(ea.write_dn(dn, 'w', dw, tmp.types))
+        _step(out, body)
     return out
 
 
@@ -910,12 +930,14 @@ def _emit_memfill_long_ind(m: PatternHit, live_out: dict) -> list[str]:
         _emit_flag_loop_tail(out, n, flag_bodies)
         out.append('}')
         return out
-    out = []
+    out: list[str] = []
     for i, addr in enumerate(m.addrs):
-        out.append(f'// ${addr:06X} move.l d{dn}, (a{an})')
-        out.append('BEFORE_INSTRUCTION')
-        out.append(f'memory().writeLong({ar}, {dr});')
-        out.extend(flag_bodies[i])
+        _step(out, [
+            f'// ${addr:06X} move.l d{dn}, (a{an})',
+            'BEFORE_INSTRUCTION',
+            f'memory().writeLong({ar}, {dr});',
+            *flag_bodies[i],
+        ])
     return out
 
 
@@ -961,11 +983,12 @@ def _emit_move_w_imm_ind_chain(m: PatternHit, live_out: dict) -> list[str]:
     for i, imm in enumerate(m.data['imms']):
         addr = m.addrs[i]
         imm_hex = ea._hex(imm)
-        out.append(f'// ${addr:06X} move.w #{imm:04X}, (a{an})')
-        out.append('BEFORE_INSTRUCTION')
-        out.append(f'memory().writeWord({ar}, WORD({imm_hex}));')
-        out.extend(sem.move(f'WORD({imm_hex})', 'w',
-                            live=_live_at(live_out, addr)))
+        _step(out, [
+            f'// ${addr:06X} move.w #{imm:04X}, (a{an})',
+            'BEFORE_INSTRUCTION',
+            f'memory().writeWord({ar}, WORD({imm_hex}));',
+            *sem.move(f'WORD({imm_hex})', 'w', live=_live_at(live_out, addr)),
+        ])
     return out
 
 
@@ -994,9 +1017,11 @@ def _emit_nop_run(m: PatternHit, live_out: dict) -> list[str]:
     # Still pace/IRQ once per original nop — timing-sensitive wait loops.
     out: list[str] = []
     for addr in m.addrs:
-        out.append(f'// ${addr:06X} nop')
-        out.append('BEFORE_INSTRUCTION')
-        out.append('(void)0;')
+        _step(out, [
+            f'// ${addr:06X} nop',
+            'BEFORE_INSTRUCTION',
+            '(void)0;',
+        ])
     return out
 
 
@@ -1039,9 +1064,11 @@ def _emit_lea_abs_chain(m: PatternHit, live_out: dict) -> list[str]:
     for i, (an, abs_val, form) in enumerate(m.data['ops']):
         addr = m.addrs[i]
         abs_hex = ea._hex(abs_val)
-        out.append(f'// ${addr:06X} lea.l ({abs_hex}).{form}, a{an}')
-        out.append('BEFORE_INSTRUCTION')
-        out.append(f'{_areg(an)} = {abs_hex};')
+        _step(out, [
+            f'// ${addr:06X} lea.l ({abs_hex}).{form}, a{an}',
+            'BEFORE_INSTRUCTION',
+            f'{_areg(an)} = {abs_hex};',
+        ])
     return out
 
 
@@ -1081,18 +1108,19 @@ def _emit_move_w_imm_then_moveq(m: PatternHit, live_out: dict) -> list[str]:
     imm_w = ea._hex(m.data['imm_w'])
     imm_q = _moveq_imm_long(m.data['imm_q'])
     dn_w, dn_q = m.data['dn_w'], m.data['dn_q']
-    out = [
+    out: list[str] = []
+    _step(out, [
         f'// ${a0:06X} move.w #{m.data["imm_w"]:04X}, d{dn_w}',
         'BEFORE_INSTRUCTION',
         ea.write_dn(dn_w, 'w', imm_w),
-    ]
-    out.extend(sem.move(imm_w, 'w', live=_live_at(live_out, a0)))
-    out += [
+        *sem.move(imm_w, 'w', live=_live_at(live_out, a0)),
+    ])
+    _step(out, [
         f'// ${a1:06X} moveq #{m.data["imm_q"]:02X}, d{dn_q}',
         'BEFORE_INSTRUCTION',
         ea.write_dn(dn_q, 'l', imm_q),
-    ]
-    out.extend(sem.move(imm_q, 'l', live=_live_at(live_out, a1)))
+        *sem.move(imm_q, 'l', live=_live_at(live_out, a1)),
+    ])
     return out
 
 
@@ -1138,19 +1166,20 @@ def _emit_imm_disp_then_moveq(m: PatternHit, live_out: dict) -> list[str]:
     imm_q = _moveq_imm_long(m.data['qimm'])
     an, disp, dn = m.data['an'], m.data['disp'], m.data['dn']
     a0, a1 = m.addrs
-    out = [
+    out: list[str] = []
+    _step(out, [
         f'// ${a0:06X} move.{size} #{m.data["store_imm"] & mask:X}, '
         f'{disp}(a{an})',
         'BEFORE_INSTRUCTION',
         f'memory().{write}(({_areg(an)} + {disp}), {cast}({imm_s}));',
-    ]
-    out.extend(sem.move(f'{cast}({imm_s})', size, live=_live_at(live_out, a0)))
-    out += [
+        *sem.move(f'{cast}({imm_s})', size, live=_live_at(live_out, a0)),
+    ])
+    _step(out, [
         f'// ${a1:06X} moveq #{m.data["qimm"]:02X}, d{dn}',
         'BEFORE_INSTRUCTION',
         ea.write_dn(dn, 'l', imm_q),
-    ]
-    out.extend(sem.move(imm_q, 'l', live=_live_at(live_out, a1)))
+        *sem.move(imm_q, 'l', live=_live_at(live_out, a1)),
+    ])
     return out
 
 
@@ -1188,11 +1217,12 @@ def _emit_abs_byte_store_chain(m: PatternHit, live_out: dict) -> list[str]:
         addr = m.addrs[i]
         imm_hex = ea._hex(imm)
         abs_hex = ea._hex(abs_val)
-        out.append(f'// ${addr:06X} move.b #{imm:02X}, ({abs_hex}).w')
-        out.append('BEFORE_INSTRUCTION')
-        out.append(f'memory().writeByte({abs_hex}, BYTE({imm_hex}));')
-        out.extend(sem.move(f'BYTE({imm_hex})', 'b',
-                            live=_live_at(live_out, addr)))
+        _step(out, [
+            f'// ${addr:06X} move.b #{imm:02X}, ({abs_hex}).w',
+            'BEFORE_INSTRUCTION',
+            f'memory().writeByte({abs_hex}, BYTE({imm_hex}));',
+            *sem.move(f'BYTE({imm_hex})', 'b', live=_live_at(live_out, addr)),
+        ])
     return out
 
 
@@ -1226,11 +1256,13 @@ def _emit_load_word_disp_chain(m: PatternHit, live_out: dict) -> list[str]:
     out: list[str] = []
     for i, (an, disp, dn) in enumerate(m.data['ops']):
         addr = m.addrs[i]
-        out.append(f'// ${addr:06X} move.w {disp}(a{an}), d{dn}')
-        out.append('BEFORE_INSTRUCTION')
-        out.append(f'm_word t = memory().readWord(({_areg(an)} + {disp}));')
-        out.append(ea.write_dn(dn, 'w', 't'))
-        out.extend(sem.move('t', 'w', live=_live_at(live_out, addr)))
+        _step(out, [
+            f'// ${addr:06X} move.w {disp}(a{an}), d{dn}',
+            'BEFORE_INSTRUCTION',
+            f'm_word t = memory().readWord(({_areg(an)} + {disp}));',
+            ea.write_dn(dn, 'w', 't'),
+            *sem.move('t', 'w', live=_live_at(live_out, addr)),
+        ])
     return out
 
 
@@ -1276,12 +1308,19 @@ def _emit_bset_imm_disp_then_moveq(m: PatternHit, live_out: dict) -> list[str]:
         raise opcodes.Unsupported('bset')
     imm_q = _moveq_imm_long(m.data['qimm'])
     dn = m.data['dn']
-    out = [f'// ${a0:06X} bset #{m.data["bit"]}, {m.data["disp"]}(a{m.data["an"]})',
-           'BEFORE_INSTRUCTION', *body,
-           f'// ${a1:06X} moveq #{m.data["qimm"]:02X}, d{dn}',
-           'BEFORE_INSTRUCTION',
-           ea.write_dn(dn, 'l', imm_q)]
-    out.extend(sem.move(imm_q, 'l', live=_live_at(live_out, a1)))
+    out: list[str] = []
+    _step(out, [
+        f'// ${a0:06X} bset #{m.data["bit"]}, '
+        f'{m.data["disp"]}(a{m.data["an"]})',
+        'BEFORE_INSTRUCTION',
+        *body,
+    ])
+    _step(out, [
+        f'// ${a1:06X} moveq #{m.data["qimm"]:02X}, d{dn}',
+        'BEFORE_INSTRUCTION',
+        ea.write_dn(dn, 'l', imm_q),
+        *sem.move(imm_q, 'l', live=_live_at(live_out, a1)),
+    ])
     return out
 
 
