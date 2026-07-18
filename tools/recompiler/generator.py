@@ -371,11 +371,6 @@ class Generator:
 
     # -- per-instruction emission --------------------------------------------
 
-    # Local declarations need a C++ block so each instruction can reuse t0/t1.
-    _LOCAL_DECL = re.compile(
-        r'^\s*(?:m_byte|m_word|m_long|bool|int|int16_t|int32_t|uint64_t)\b'
-    )
-
     def _emit_instr(self, instr, live_out=None):
         try:
             if instr.mnemonic in opcodes.FLOW_MNEMONICS:
@@ -395,19 +390,13 @@ class Generator:
         if self.part.needs_label(instr.address):
             lines.append(f'{self.label(instr.address)}:')
         lines.append(f'// ${instr.address:06X} {instr}')
-        # Scope only when the body declares locals (temps).  Pure assignments
-        # and control flow stay unbraced so the listing reads flatter.
-        needs_scope = any(self._LOCAL_DECL.match(s) for s in body)
-        if needs_scope:
-            lines.append('{')
-            indent = '    '
-            lines.append(f'{indent}BEFORE_INSTRUCTION')
-            for stmt in body:
-                lines.append(f'{indent}{stmt}')
-            lines.append('}')
-        else:
-            lines.append('BEFORE_INSTRUCTION')
-            lines.extend(body)
+        # One block per instruction so short temps (t0/t1) can be reused safely.
+        # Always braced for a uniform listing — the C++ compiler optimizes this.
+        lines.append('{')
+        lines.append('    BEFORE_INSTRUCTION')
+        for stmt in body:
+            lines.append(f'    {stmt}')
+        lines.append('}')
         return lines
 
     # -- movem (register-list memory block transfer) --------------------------
