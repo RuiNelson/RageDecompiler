@@ -18,6 +18,10 @@ CAST_MACROS = r'''
 #define WORD(v) static_cast<m_word>(v)
 #define LONG(v) static_cast<m_long>(v)
 #define BEFORE_INSTRUCTION if (irqLevel() > cpu().interruptMask()) serviceIRQ(); pace();
+// Diagnostic only: define SOR_TRACE when building to enable entry/RTS logging.
+#ifndef SOR_TRACE
+#define traceEnter(addr) ((void)0)
+#endif
 '''
 
 _SIGN = {'b': '0x80u', 'w': '0x8000u', 'l': '0x80000000u'}

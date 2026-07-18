@@ -313,6 +313,25 @@ def test_irq_check_emitted_before_each_instruction():
     assert '#define F_Z' not in src
     assert 'cpu().enterInterrupt(level);' in src
     assert '#include "M68KMacros.hpp"' not in src
+    assert '#define traceEnter(addr) ((void)0)' in src
+    assert '#ifdef SOR_TRACE' in src
+
+
+def test_simple_instr_omits_braces_when_no_locals():
+    """lea / bra-style bodies without declarations stay unbraced."""
+    ins = {
+        0x100: _fn_instr(0x100, 'lea', 'l',
+                         [EA(EAMode.ABS_L, abs_value=0x1000),
+                          EA(EAMode.ADDR_REG, reg=0)]),
+        0x106: _fn_instr(0x106, 'rts', None, [], FlowType.RETURN, bl=2),
+    }
+    # lea is 6 bytes typically but byte_length on synthetic may be 2 — fine for emit
+    src = Generator(ins, {0x100}).emit_source()
+    body = _function_source(src, 'sub_000100')
+    lea = body.split('// $000100')[1].split('// $000106')[0]
+    assert 'BEFORE_INSTRUCTION' in lea
+    assert 'cpu().a[0] =' in lea
+    assert '{' not in lea  # no scope block for declaration-free body
 
 
 # --- CCR liveness (omit dead flag updates) --------------------------------

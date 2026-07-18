@@ -323,11 +323,13 @@ class Generator:
         if m == 'rts':
             return [
                 'cpu().ssp += 4;',
+                '#ifdef SOR_TRACE',
                 'if ((cpu().ssp & 0x00FFFFFFu) > 0x00FFFF00u) {',
                 '    std::fprintf(stderr, "[RTS] ssp=$%06X fn=$%06X\\n",',
                 '                 static_cast<unsigned>(cpu().ssp & 0x00FFFFFFu),',
                 '                 static_cast<unsigned>(lastFunction() & 0x00FFFFFFu));',
                 '}',
+                '#endif',
                 'return;',
             ]
 
@@ -369,6 +371,11 @@ class Generator:
 
     # -- per-instruction emission --------------------------------------------
 
+    # Local declarations need a C++ block so each instruction can reuse t0/t1.
+    _LOCAL_DECL = re.compile(
+        r'^\s*(?:m_byte|m_word|m_long|bool|int|int16_t|int32_t|uint64_t)\b'
+    )
+
     def _emit_instr(self, instr, live_out=None):
         try:
             if instr.mnemonic in opcodes.FLOW_MNEMONICS:
@@ -388,11 +395,19 @@ class Generator:
         if self.part.needs_label(instr.address):
             lines.append(f'{self.label(instr.address)}:')
         lines.append(f'// ${instr.address:06X} {instr}')
-        lines.append('{')
-        lines.append('    BEFORE_INSTRUCTION')
-        for stmt in body:
-            lines.append(f'    {stmt}')
-        lines.append('}')
+        # Scope only when the body declares locals (temps).  Pure assignments
+        # and control flow stay unbraced so the listing reads flatter.
+        needs_scope = any(self._LOCAL_DECL.match(s) for s in body)
+        if needs_scope:
+            lines.append('{')
+            indent = '    '
+            lines.append(f'{indent}BEFORE_INSTRUCTION')
+            for stmt in body:
+                lines.append(f'{indent}{stmt}')
+            lines.append('}')
+        else:
+            lines.append('BEFORE_INSTRUCTION')
+            lines.extend(body)
         return lines
 
     # -- movem (register-list memory block transfer) --------------------------
@@ -528,7 +543,7 @@ class Generator:
 
     def _emit_function(self, func):
         out = [f'void Sor::{self.fn(func.entry)}(m_long entry_) {{']
-        out.append(f'    traceEnter({ea._hex(func.entry)}); // diagnostic')
+        out.append(f'    traceEnter({ea._hex(func.entry)});')
         return self._emit_function_body(func, out)
 
     def _emit_function_body(self, func, out):
