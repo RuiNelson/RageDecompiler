@@ -15,6 +15,7 @@ generator fails loudly — the recompiler must translate 100% of what it sees.
 from tools.disassembler.instruction import EAMode
 from tools.recompiler import ea_codegen as ea
 from tools.recompiler import cpp_semantics as sem
+from tools.recompiler.ccr_liveness import ALL, NZVC
 from tools.recompiler.ea_codegen import EAGenError, TempPool
 
 _SUF = {'b': 'B', 'w': 'W', 'l': 'L'}
@@ -49,7 +50,12 @@ def _signext_to_long(expr: str, size: str) -> str:
     return ea.signext_to_long(expr, size)
 
 
-def emit_dataop(instr):
+def emit_dataop(instr, live_flags=None):
+    """Lower *instr* to C++ statements.
+
+    ``live_flags`` is the set of CCR flags that are still observed after this
+    instruction (see ``ccr_liveness``).  ``None`` means all flags are live.
+    """
     m = instr.mnemonic
     if m in FLOW_MNEMONICS or m in GENERATOR_MNEMONICS:
         return None
@@ -58,7 +64,7 @@ def emit_dataop(instr):
     handler = _HANDLERS.get(m)
     if handler is None:
         raise Unsupported(m)
-    return handler(instr, TempPool(instr.address))
+    return handler(instr, TempPool(instr.address), live_flags)
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +104,7 @@ def _special_write(e, value):
 # Handlers
 # ---------------------------------------------------------------------------
 
-def _move(instr, tmp):
+def _move(instr, tmp, live=None):
     size = _sized(instr)
     src, dst = instr.eas[0], instr.eas[1]
 
@@ -123,23 +129,22 @@ def _move(instr, tmp):
     r = tmp.fresh()
     stmts.append(f'{ea._CTYPE[size]} {r} = {val};')
     stmts += ea.write_ea(dst, size, r, tmp)
-    return stmts + sem.move(r, size)
+    return stmts + sem.move(r, size, live=live)
 
 
-def _moveq(instr, tmp):
+def _moveq(instr, tmp, live=None):
     src, dst = instr.eas[0], instr.eas[1]
     r = tmp.fresh()
     imm = src.imm & 0xFF
     return [
         f'm_long {r} = LONG(static_cast<int32_t>(static_cast<int8_t>({imm})));',
         ea.write_dn(dst.reg, 'l', r),
-    ] + sem.move(r, 'l')
+    ] + sem.move(r, 'l', live=live)
 
 
-def _arith(instr, tmp, op):
+def _arith(instr, tmp, op, live=None):
     """add / sub / cmp families (op in {'ADD','SUB','CMP'})."""
     size = _sized(instr)
-    suf = _SUF[size]
     src, dst = instr.eas[0], instr.eas[1]
 
     if dst.mode == EAMode.ADDR_REG:               # adda / suba / cmpa
@@ -148,25 +153,32 @@ def _arith(instr, tmp, op):
         s_stmts, sval = ea.read_ea(src, size, tmp)
         ar = ea.areg(dst.reg)
         if op == 'CMP':
-            return s_stmts + sem.cmpa(ar, sval, size, tmp)
+            return s_stmts + sem.cmpa(ar, sval, size, tmp, live=live)
         return s_stmts + (sem.adda(ar, sval, size) if op == 'ADD'
                           else sem.suba(ar, sval, size))
 
-    s_stmts, sval = ea.read_ea(src, size, tmp)
     if op == 'CMP':
+        # When all compare flags are dead, skip the compare entirely and only
+        # preserve addressing-mode side effects (postinc / predec).
+        live_set = ALL if live is None else frozenset(live)
+        if not (live_set & NZVC):
+            return _touch_ea(src, size, tmp) + _touch_ea(dst, size, tmp)
+        s_stmts, sval = ea.read_ea(src, size, tmp)
         d_stmts, dval = ea.read_ea(dst, size, tmp)
-        return s_stmts + d_stmts + sem.cmp(dval, sval, size, tmp)
+        return s_stmts + d_stmts + sem.cmp(dval, sval, size, tmp, live=live)
+    s_stmts, sval = ea.read_ea(src, size, tmp)
     pre, r, post = ea.rmw_ea(dst, size, tmp)
-    op_stmts = sem.add(r, sval, size, tmp) if op == 'ADD' else sem.sub(r, sval, size, tmp)
+    op_stmts = (sem.add(r, sval, size, tmp, live=live) if op == 'ADD'
+                else sem.sub(r, sval, size, tmp, live=live))
     return s_stmts + pre + op_stmts + post
 
 
-def _add(instr, tmp): return _arith(instr, tmp, 'ADD')
-def _sub(instr, tmp): return _arith(instr, tmp, 'SUB')
-def _cmp(instr, tmp): return _arith(instr, tmp, 'CMP')
+def _add(instr, tmp, live=None): return _arith(instr, tmp, 'ADD', live)
+def _sub(instr, tmp, live=None): return _arith(instr, tmp, 'SUB', live)
+def _cmp(instr, tmp, live=None): return _arith(instr, tmp, 'CMP', live)
 
 
-def _logic(instr, tmp, op):
+def _logic(instr, tmp, op, live=None):
     size = _sized(instr)
     src, dst = instr.eas[0], instr.eas[1]
     # andi/ori/eori to SR or CCR.
@@ -177,34 +189,49 @@ def _logic(instr, tmp, op):
         return s_stmts + _special_write(dst, f'({cur} {cxx} {sval})')
     s_stmts, sval = ea.read_ea(src, size, tmp)
     pre, r, post = ea.rmw_ea(dst, size, tmp)
-    return s_stmts + pre + sem.logic_op(r, sval, size, op) + post
+    return s_stmts + pre + sem.logic_op(r, sval, size, op, live=live) + post
 
 
-def _and(instr, tmp): return _logic(instr, tmp, 'AND')
-def _or(instr, tmp):  return _logic(instr, tmp, 'OR')
-def _eor(instr, tmp): return _logic(instr, tmp, 'EOR')
+def _and(instr, tmp, live=None): return _logic(instr, tmp, 'AND', live)
+def _or(instr, tmp, live=None):  return _logic(instr, tmp, 'OR', live)
+def _eor(instr, tmp, live=None): return _logic(instr, tmp, 'EOR', live)
 
 
-def _tst(instr, tmp):
+def _ea_has_side_effects(e) -> bool:
+    return e.mode in (EAMode.ADDR_POSTINC, EAMode.ADDR_PREDEC)
+
+
+def _touch_ea(e, size, tmp):
+    """Emit only addressing-mode side effects (postinc/predec)."""
+    if _ea_has_side_effects(e):
+        stmts, _ = ea.read_ea(e, size, tmp)
+        return stmts
+    return []
+
+
+def _tst(instr, tmp, live=None):
     size = _sized(instr)
+    live_set = ALL if live is None else frozenset(live)
+    if not (live_set & NZVC):
+        return _touch_ea(instr.eas[0], size, tmp)
     stmts, val = ea.read_ea(instr.eas[0], size, tmp)
-    return stmts + sem.logical(val, size)
+    return stmts + sem.logical(val, size, live=live)
 
 
-def _clr(instr, tmp):
+def _clr(instr, tmp, live=None):
     size = _sized(instr)
     r = tmp.fresh()
-    stmts = [f'{ea._CTYPE[size]} {r} = 0;'] + sem.clr(r, size)
+    stmts = [f'{ea._CTYPE[size]} {r} = 0;'] + sem.clr(r, size, live=live)
     return stmts + ea.write_ea(instr.eas[0], size, r, tmp)
 
 
-def _lea(instr, tmp):
+def _lea(instr, tmp, live=None):
     src, dst = instr.eas[0], instr.eas[1]
     setup, addr = ea.address_of(src, tmp)
     return setup + [f'{ea.areg(dst.reg)} = LONG({addr});']
 
 
-def _pea(instr, tmp):
+def _pea(instr, tmp, live=None):
     setup, addr = ea.address_of(instr.eas[0], tmp)
     return setup + [
         'cpu().ssp -= 4;',
@@ -212,37 +239,38 @@ def _pea(instr, tmp):
     ]
 
 
-def _unary(instr, tmp, macro):
+def _unary(instr, tmp, macro, live=None):
     """neg / not — read-modify-write a single operand via a no-arg macro."""
     size = _sized(instr)
     pre, r, post = ea.rmw_ea(instr.eas[0], size, tmp)
-    op = sem.neg(r, size, tmp) if macro == 'NEG' else sem.not_op(r, size)
+    op = (sem.neg(r, size, tmp, live=live) if macro == 'NEG'
+          else sem.not_op(r, size, live=live))
     return pre + op + post
 
 
-def _neg(instr, tmp): return _unary(instr, tmp, 'NEG')
-def _not(instr, tmp): return _unary(instr, tmp, 'NOT')
+def _neg(instr, tmp, live=None): return _unary(instr, tmp, 'NEG', live)
+def _not(instr, tmp, live=None): return _unary(instr, tmp, 'NOT', live)
 
 
-def _swap(instr, tmp):
+def _swap(instr, tmp, live=None):
     n = instr.eas[0].reg
     r = tmp.fresh()
     return [f'm_long {r} = {ea.read_dn(n, "l")};',
-            *sem.swap(r),
+            *sem.swap(r, live=live),
             ea.write_dn(n, 'l', r)]
 
 
-def _ext(instr, tmp):
+def _ext(instr, tmp, live=None):
     n = instr.eas[0].reg
-    return sem.ext(n, instr.size or 'w', tmp)
+    return sem.ext(n, instr.size or 'w', tmp, live=live)
 
 
-def _shift(instr, tmp, macro):
+def _shift(instr, tmp, macro, live=None):
     """Shift/rotate. Forms: '<op> #cnt, Dn' / '<op> Dm, Dn' / '<op> <ea>' (×1)."""
     size = _sized(instr)
     if len(instr.eas) == 1:                       # memory shift, count = 1
         pre, r, post = ea.rmw_ea(instr.eas[0], size, tmp)
-        return pre + sem.shift(r, '1', size, macro, tmp) + post
+        return pre + sem.shift(r, '1', size, macro, tmp, live=live) + post
     count, dst = instr.eas[0], instr.eas[1]
     if count.mode == EAMode.IMMEDIATE:
         setup, cnt = [], str((count.imm - 1) % 8 + 1)  # immediate count is 1..8
@@ -252,10 +280,11 @@ def _shift(instr, tmp, macro):
     pre, r, post = ea.rmw_ea(dst, size, tmp)
     return setup + pre + \
         sem.shift(r, cnt, size, macro, tmp,
-                  count_may_be_zero=count.mode != EAMode.IMMEDIATE) + post
+                  count_may_be_zero=count.mode != EAMode.IMMEDIATE,
+                  live=live) + post
 
 
-def _muldiv(instr, tmp, macro):
+def _muldiv(instr, tmp, macro, live=None):
     """mulu/muls (16×16→Dn long) and divu/divs (Dn 32 ÷ src16 → Dn)."""
     src, dst = instr.eas[0], instr.eas[1]
     s_stmts, sval = ea.read_ea(src, 'w', tmp)
@@ -263,11 +292,11 @@ def _muldiv(instr, tmp, macro):
         dexpr = ea.read_dn(dst.reg, 'w')
     else:
         dexpr = ea.read_dn(dst.reg, 'l')
-    op_stmts, result = sem.muldiv(dexpr, sval, macro, tmp)
+    op_stmts, result = sem.muldiv(dexpr, sval, macro, tmp, live=live)
     return s_stmts + op_stmts + [ea.write_dn(dst.reg, 'l', result)]
 
 
-def _bitop(instr, tmp, kind):
+def _bitop(instr, tmp, kind, live=None):
     bit_ea, dst = instr.eas[0], instr.eas[1]
     data_reg = dst.mode == EAMode.DATA_REG
     size = 'l' if data_reg else 'b'
@@ -278,9 +307,9 @@ def _bitop(instr, tmp, kind):
         bit = f'(cpu().d[{bit_ea.reg}] % {modulo})'
     if kind == 'BTST':
         stmts, val = ea.read_ea(dst, size, tmp)
-        return stmts + sem.bitop(val, bit, kind, size)
+        return stmts + sem.bitop(val, bit, kind, size, live=live)
     pre, r, post = ea.rmw_ea(dst, size, tmp)
-    return pre + sem.bitop(r, bit, kind, size) + post
+    return pre + sem.bitop(r, bit, kind, size, live=live) + post
 
 
 def _scc(instr, tmp, cc):
@@ -297,32 +326,32 @@ def _reg_lvalue(e):
     raise EAGenError(f'exg operand is not a register: {e.mode}')
 
 
-def _exg(instr, tmp):
+def _exg(instr, tmp, live=None):
     a = _reg_lvalue(instr.eas[0])
     b = _reg_lvalue(instr.eas[1])
     t = tmp.fresh()
     return [f'm_long {t} = {a};', f'{a} = {b};', f'{b} = {t};']
 
 
-def _bcd(instr, tmp, macro):
+def _bcd(instr, tmp, macro, live=None):
     src, dst = instr.eas[0], instr.eas[1]
     s_stmts, sval = ea.read_ea(src, 'b', tmp)
     pre, r, post = ea.rmw_ea(dst, 'b', tmp)
-    return s_stmts + pre + sem.bcd(r, sval, macro, tmp) + post
+    return s_stmts + pre + sem.bcd(r, sval, macro, tmp, live=live) + post
 
 
-def _nbcd(instr, tmp):
+def _nbcd(instr, tmp, live=None):
     pre, r, post = ea.rmw_ea(instr.eas[0], 'b', tmp)
-    return pre + sem.nbcd(r, tmp) + post
+    return pre + sem.nbcd(r, tmp, live=live) + post
 
 
-def _negx(instr, tmp):
+def _negx(instr, tmp, live=None):
     size = _sized(instr)
     pre, r, post = ea.rmw_ea(instr.eas[0], size, tmp)
-    return pre + sem.negx(r, size, tmp) + post
+    return pre + sem.negx(r, size, tmp, live=live) + post
 
 
-def _movep(instr, tmp):
+def _movep(instr, tmp, live=None):
     """Transfer bytes between Dn and alternating memory addresses. No CCR effect."""
     size = _sized(instr)  # 'w' or 'l'
     src, dst = instr.eas[0], instr.eas[1]
@@ -358,7 +387,7 @@ def _movep(instr, tmp):
         return stmts
 
 
-def _nop(instr, tmp):
+def _nop(instr, tmp, live=None):
     return ['(void)0;']
 
 
@@ -375,25 +404,25 @@ _HANDLERS = {
     'tst': _tst, 'clr': _clr, 'lea': _lea, 'pea': _pea,
     'swap': _swap, 'ext': _ext,
     'neg': _neg, 'not': _not,
-    'btst': lambda i, t: _bitop(i, t, 'BTST'),
-    'bset': lambda i, t: _bitop(i, t, 'BSET'),
-    'bclr': lambda i, t: _bitop(i, t, 'BCLR'),
-    'bchg': lambda i, t: _bitop(i, t, 'BCHG'),
-    'lsl': lambda i, t: _shift(i, t, 'LSL'),
-    'lsr': lambda i, t: _shift(i, t, 'LSR'),
-    'asl': lambda i, t: _shift(i, t, 'ASL'),
-    'asr': lambda i, t: _shift(i, t, 'ASR'),
-    'rol': lambda i, t: _shift(i, t, 'ROL'),
-    'ror': lambda i, t: _shift(i, t, 'ROR'),
-    'roxl': lambda i, t: _shift(i, t, 'ROXL'),
-    'roxr': lambda i, t: _shift(i, t, 'ROXR'),
-    'mulu': lambda i, t: _muldiv(i, t, 'MULU'),
-    'muls': lambda i, t: _muldiv(i, t, 'MULS'),
-    'divu': lambda i, t: _muldiv(i, t, 'DIVU'),
-    'divs': lambda i, t: _muldiv(i, t, 'DIVS'),
+    'btst': lambda i, t, live=None: _bitop(i, t, 'BTST', live),
+    'bset': lambda i, t, live=None: _bitop(i, t, 'BSET', live),
+    'bclr': lambda i, t, live=None: _bitop(i, t, 'BCLR', live),
+    'bchg': lambda i, t, live=None: _bitop(i, t, 'BCHG', live),
+    'lsl': lambda i, t, live=None: _shift(i, t, 'LSL', live),
+    'lsr': lambda i, t, live=None: _shift(i, t, 'LSR', live),
+    'asl': lambda i, t, live=None: _shift(i, t, 'ASL', live),
+    'asr': lambda i, t, live=None: _shift(i, t, 'ASR', live),
+    'rol': lambda i, t, live=None: _shift(i, t, 'ROL', live),
+    'ror': lambda i, t, live=None: _shift(i, t, 'ROR', live),
+    'roxl': lambda i, t, live=None: _shift(i, t, 'ROXL', live),
+    'roxr': lambda i, t, live=None: _shift(i, t, 'ROXR', live),
+    'mulu': lambda i, t, live=None: _muldiv(i, t, 'MULU', live),
+    'muls': lambda i, t, live=None: _muldiv(i, t, 'MULS', live),
+    'divu': lambda i, t, live=None: _muldiv(i, t, 'DIVU', live),
+    'divs': lambda i, t, live=None: _muldiv(i, t, 'DIVS', live),
     'exg': _exg,
-    'abcd': lambda i, t: _bcd(i, t, 'ABCD'),
-    'sbcd': lambda i, t: _bcd(i, t, 'SBCD'),
+    'abcd': lambda i, t, live=None: _bcd(i, t, 'ABCD', live),
+    'sbcd': lambda i, t, live=None: _bcd(i, t, 'SBCD', live),
     'nbcd': _nbcd,
     'negx': _negx,
     'nop': _nop,

@@ -295,6 +295,97 @@ def test_irq_check_emitted_before_each_instruction():
     assert '#include "M68KMacros.hpp"' not in src
 
 
+# --- CCR liveness (omit dead flag updates) --------------------------------
+
+def _fn_instr(addr, mnem, size, eas, flow=FlowType.SEQUENTIAL, bl=2, targets=None):
+    ins = Instruction(address=addr, mnemonic=mnem, size=size, operands=[],
+                      byte_length=bl, flow=flow, eas=eas or [],
+                      targets=list(targets or []))
+    return ins
+
+
+def test_dead_move_flags_omitted_before_overwriting_move():
+    """move; move; rts — only the last move's CCR update is observable."""
+    ins = {
+        0x100: _fn_instr(0x100, 'move', 'l',
+                         [EA(EAMode.DATA_REG, reg=0), EA(EAMode.DATA_REG, reg=1)]),
+        0x102: _fn_instr(0x102, 'move', 'l',
+                         [EA(EAMode.DATA_REG, reg=2), EA(EAMode.DATA_REG, reg=3)]),
+        0x104: _fn_instr(0x104, 'rts', None, [], FlowType.RETURN),
+    }
+    src = Generator(ins, {0x100}).emit_source()
+    body = _function_source(src, 'sub_000100')
+    # Data moves still happen…
+    assert 'cpu().d[1] = LONG(' in body
+    assert 'cpu().d[3] = LONG(' in body
+    # …but only the second move updates flags (escape via rts).
+    assert body.count('setNZClearVC') == 1
+    first_move = body.split('// $000100')[1].split('// $000102')[0]
+    second_move = body.split('// $000102')[1].split('// $000104')[0]
+    assert 'setNZ' not in first_move
+    assert 'setNZClearVC' in second_move
+
+
+def test_live_flags_kept_before_conditional_branch():
+    """move; beq; rts — the branch reads Z, so the move must set flags."""
+    ins = {
+        0x100: _fn_instr(0x100, 'move', 'l',
+                         [EA(EAMode.DATA_REG, reg=0), EA(EAMode.DATA_REG, reg=1)]),
+        0x102: _fn_instr(0x102, 'beq', None, [], FlowType.CONDITIONAL,
+                         targets=[0x108]),
+        0x104: _fn_instr(0x104, 'rts', None, [], FlowType.RETURN),
+        0x108: _fn_instr(0x108, 'rts', None, [], FlowType.RETURN),
+    }
+    src = Generator(ins, {0x100}).emit_source()
+    body = _function_source(src, 'sub_000100')
+    assert 'setNZClearVC' in body
+    assert 'condition(7)' in body
+
+
+def test_dead_cmp_omitted_entirely():
+    """cmp whose flags are immediately overwritten is a pure no-op."""
+    ins = {
+        0x100: _fn_instr(0x100, 'cmp', 'l',
+                         [EA(EAMode.DATA_REG, reg=0), EA(EAMode.DATA_REG, reg=1)]),
+        0x102: _fn_instr(0x102, 'move', 'l',
+                         [EA(EAMode.DATA_REG, reg=2), EA(EAMode.DATA_REG, reg=3)]),
+        0x104: _fn_instr(0x104, 'rts', None, [], FlowType.RETURN),
+    }
+    src = Generator(ins, {0x100}).emit_source()
+    body = _function_source(src, 'sub_000100')
+    # cmp block should have no arithmetic / flag work — only BEFORE scaffolding.
+    cmp_region = body.split('// $000100')[1].split('// $000102')[0]
+    assert 'setNZ' not in cmp_region
+    assert ' - ' not in cmp_region
+    assert 'cpu().d[3]' in body  # trailing move still present
+
+
+def test_emit_dataop_live_flags_none_keeps_full_update():
+    """Unit-level emit with live=None (default) still emits full CCR update."""
+    out = '\n'.join(opcodes.emit_dataop(_instr(
+        'move', 'l', [EA(EAMode.DATA_REG, reg=0), EA(EAMode.DATA_REG, reg=1)])))
+    assert 'setNZClearVC' in out
+
+
+def test_emit_dataop_empty_live_omits_flags():
+    out = '\n'.join(opcodes.emit_dataop(
+        _instr('move', 'l',
+               [EA(EAMode.DATA_REG, reg=0), EA(EAMode.DATA_REG, reg=1)]),
+        live_flags=frozenset()))
+    assert 'cpu().d[1]' in out
+    assert 'setNZ' not in out
+    assert 'setFlag' not in out
+
+
+def test_ccr_effects_move_vs_beq():
+    from tools.recompiler import ccr_liveness as ccr
+    move = _fn_instr(0x100, 'move', 'l',
+                     [EA(EAMode.DATA_REG, reg=0), EA(EAMode.DATA_REG, reg=1)])
+    beq = _fn_instr(0x102, 'beq', None, [], FlowType.CONDITIONAL, targets=[0x108])
+    assert ccr.effects(move) == (frozenset(), ccr.NZVC)
+    assert ccr.effects(beq) == (frozenset({ccr.Z}), frozenset())
+
+
 def test_jsr_emits_nonlocal_return_guard():
     ins = {
         0x100: _instr('jsr', None, [], FlowType.CALL),

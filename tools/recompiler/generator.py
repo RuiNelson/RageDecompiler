@@ -20,6 +20,7 @@ from tools.disassembler.instruction import FlowType, EAMode
 from tools.recompiler import cpp_semantics as sem
 from tools.recompiler import ea_codegen as ea
 from tools.recompiler import opcodes
+from tools.recompiler import ccr_liveness
 from tools.recompiler.opcodes import Unsupported
 from tools.recompiler.ea_codegen import EAGenError, TempPool
 from tools.recompiler.regions import partition
@@ -368,14 +369,14 @@ class Generator:
 
     # -- per-instruction emission --------------------------------------------
 
-    def _emit_instr(self, instr):
+    def _emit_instr(self, instr, live_out=None):
         try:
             if instr.mnemonic in opcodes.FLOW_MNEMONICS:
                 body = self._emit_flow(instr)
             elif instr.mnemonic == 'movem':
                 body = self._emit_movem(instr)
             else:
-                body = opcodes.emit_dataop(instr)
+                body = opcodes.emit_dataop(instr, live_flags=live_out)
                 if body is None:
                     raise Unsupported(instr.mnemonic)
         except (Unsupported, EAGenError) as exc:
@@ -544,9 +545,13 @@ class Generator:
             out.append('    }')
         else:
             out.append('    (void)entry_;')
+        # Omit CCR updates for flags that no later reader observes.
+        live_out = ccr_liveness.analyze(
+            addrs, self.ins, self.part.func_of, func.entry)
         falls_through = (FlowType.SEQUENTIAL, FlowType.CONDITIONAL, FlowType.CALL)
         for index, addr in enumerate(addrs):
-            out += [f'    {ln}' for ln in self._emit_instr(self.ins[addr])]
+            live = live_out.get(addr, ccr_liveness.ALL)
+            out += [f'    {ln}' for ln in self._emit_instr(self.ins[addr], live)]
             instr = self.ins[addr]
             next_emitted = addrs[index + 1] if index + 1 < len(addrs) else None
             if (next_emitted is not None and instr.flow in falls_through

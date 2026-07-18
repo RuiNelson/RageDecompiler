@@ -6,9 +6,10 @@ subclass whose ``run()`` is the recompiled cartridge code.
 
 Pipeline
 --------
-``ea_codegen``   EA  → C++ read/write/address expressions (with temporaries).
-``opcodes``      Instruction → C++ statement(s) (operation + CCR flags).
-``regions``      Partition instructions into functions; loops stay as loops.
-``generator``    Orchestrate emission of the Sor.hpp / Sor.cpp pair.
-``main``         CLI entry point.
+``ea_codegen``     EA  → C++ read/write/address expressions (with temporaries).
+``opcodes``        Instruction → C++ statement(s) (operation + CCR flags).
+``ccr_liveness``   Per-flag CCR liveness; dead flag updates are omitted.
+``regions``        Partition instructions into functions; loops stay as loops.
+``generator``      Orchestrate emission of the Sor.hpp / Sor.cpp pair.
+``main``           CLI entry point.
 """
