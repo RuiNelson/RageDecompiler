@@ -125,6 +125,14 @@ Arguments and options:
 Notes:
 
 - The generated `Sor.cpp` is self-contained; it emits small one-line cast macros and all 68000 instruction semantics directly.
+- The recompiler mines repeated multi-instruction shapes inside subroutines
+  (classic 68000 assembler-macro idioms: structure field init, `moveq`
+  prologues, block fills/copies) and emits them as fused sequence blocks.
+  Safety is strict: no fusion across labels or mid-function entries, no
+  fusion of control-flow/`movem`, one `BEFORE_INSTRUCTION` per original
+  opcode (IRQ + pace), per-instruction CCR liveness preserved, and no
+  register/memory values cached across an IRQ check. Identical ops of
+  length ≥ 4 become a compact `for` loop.
 - If `--speculative` is not provided, no `confirmSpeculative` hooks are emitted.
 - Each valid instruction reached only from a speculative candidate gets its own
   lightweight C++ entry function. The recompiler also validates every aligned

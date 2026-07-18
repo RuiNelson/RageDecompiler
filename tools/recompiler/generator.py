@@ -14,13 +14,14 @@ come from the labels CSV when present (falling back to ``sub_XXXXXX`` /
 
 import bisect
 import re
-from collections import deque
+from collections import Counter, deque
 
 from tools.disassembler.instruction import FlowType, EAMode
 from tools.recompiler import cpp_semantics as sem
 from tools.recompiler import ea_codegen as ea
 from tools.recompiler import opcodes
 from tools.recompiler import ccr_liveness
+from tools.recompiler import sequences
 from tools.recompiler.opcodes import Unsupported
 from tools.recompiler.ea_codegen import EAGenError, TempPool
 from tools.recompiler.regions import partition
@@ -187,6 +188,16 @@ class Generator:
         # emit_source before the second pass; _transfer skips direct calls to
         # rejected functions.
         self._rejected: set = set()
+        # Classic 68000-style sequence macros: discover the most repeated
+        # fusible multi-instruction shapes across subroutines, then fuse them
+        # at emit time (see tools.recompiler.sequences).
+        self.seq_stats = sequences.SequenceStats()
+        self._known_patterns, pattern_counts = sequences.discover_patterns(
+            self._eff_addrs, self.ins, self.part.needs_label)
+        # Stats show only shapes that actually qualified as macros.
+        self.seq_stats.pattern_counts = Counter(
+            {p: c for p, c in pattern_counts.items()
+             if p in self._known_patterns})
         self._build_fn_names(self._names)
         self._build_speculative_fn_names()
         self._build_label_names(self._names)
@@ -547,7 +558,40 @@ class Generator:
         live_out = ccr_liveness.analyze(
             addrs, self.ins, self.part.func_of, func.entry)
         falls_through = (FlowType.SEQUENTIAL, FlowType.CONDITIONAL, FlowType.CALL)
-        for index, addr in enumerate(addrs):
+        index = 0
+        while index < len(addrs):
+            match = sequences.find_match(
+                addrs, index, self.ins, self.part.needs_label,
+                self._known_patterns)
+            if match is not None:
+                try:
+                    seq_lines, used_loop = sequences.emit_sequence(
+                        match, self.ins, live_out,
+                        emit_one=self._emit_data_body,
+                        needs_label=self.part.needs_label,
+                        label_name=self.label)
+                except (Unsupported, EAGenError):
+                    # Fall back to per-instruction emission on any lowering miss
+                    # so a sequence optimiser never soft-fails a whole function.
+                    pass
+                else:
+                    out += [f'    {ln}' for ln in seq_lines]
+                    self.stats.handled += len(match.addrs)
+                    self.seq_stats.note_fuse(len(match.addrs), used_loop=used_loop)
+                    last_addr = match.addrs[-1]
+                    last_instr = self.ins[last_addr]
+                    next_index = index + len(match.addrs)
+                    next_emitted = (addrs[next_index]
+                                    if next_index < len(addrs) else None)
+                    if (next_emitted is not None
+                            and last_instr.flow in falls_through
+                            and last_instr.next_address != next_emitted):
+                        out += [f'    {ln}' for ln in self._transfer(
+                            last_addr, last_instr.next_address)]
+                    index = next_index
+                    continue
+
+            addr = addrs[index]
             live = live_out.get(addr, ccr_liveness.ALL)
             out += [f'    {ln}' for ln in self._emit_instr(self.ins[addr], live)]
             instr = self.ins[addr]
@@ -556,6 +600,7 @@ class Generator:
                     and instr.next_address != next_emitted):
                 out += [f'    {ln}' for ln in self._transfer(
                     addr, instr.next_address)]
+            index += 1
         # A function whose last instruction falls through (no RTS/RTE/BRA/JMP)
         # is hand-optimized 68000 code sharing a tail with whatever comes next
         # in ROM order — real hardware just keeps executing into it. Tail-call
@@ -570,6 +615,17 @@ class Generator:
             out.append('    return;')
         out.append('}')
         return out
+
+    def _emit_data_body(self, instr, live_out=None):
+        """Body statements of one data op (no braces / BEFORE / labels)."""
+        if instr.mnemonic == 'nop':
+            return ['(void)0;']
+        if instr.mnemonic == 'movem':
+            return self._emit_movem(instr)
+        body = opcodes.emit_dataop(instr, live_flags=live_out)
+        if body is None:
+            raise Unsupported(instr.mnemonic)
+        return body
 
     def _emit_speculative_wrapper(self, addr):
         """Emit one exact-address entry function without duplicating its body."""
@@ -631,7 +687,12 @@ class Generator:
         # of generating direct C++ function calls to non-existent bodies.
         self._rejected = rejected
         # Re-translate: _transfer now knows which targets are rejected and emits
-        # dispatch() for them so their callers still link correctly.
+        # dispatch() for them so their callers still link correctly.  Reset
+        # per-instruction counters so the probe pass above does not double-count.
+        self.stats = Stats()
+        self.seq_stats.fused_sequences = 0
+        self.seq_stats.fused_instructions = 0
+        self.seq_stats.loop_sequences = 0
         bodies = {e: '\n'.join(self._emit_function(self.part.functions[e]))
                   for e in self.part.entries
                   if e not in rejected and e not in self._manual_functions}
