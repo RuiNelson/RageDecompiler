@@ -125,14 +125,6 @@ Arguments and options:
 Notes:
 
 - The generated `Sor.cpp` is self-contained; it emits small one-line cast macros and all 68000 instruction semantics directly.
-- Multi-instruction **patterns** (classic 68000 assembler macros) are matched
-  from a hand-written catalog in `tools/recompiler/patterns.py`.  Each pattern
-  has a matcher plus a custom C++ emitter; only registered patterns are
-  substituted.  The recompile log lists hits and also **unhandled frequent
-  shapes** as candidates for new handlers.  Safety gate: no match across
-  labels / mid-function entries, no control-flow / `movem` inside a run; each
-  emitter must emit one `BEFORE_INSTRUCTION` per original opcode and must not
-  cache register/memory values across that check.
 - If `--speculative` is not provided, no `confirmSpeculative` hooks are emitted.
 - Each valid instruction reached only from a speculative candidate gets its own
   lightweight C++ entry function. The recompiler also validates every aligned

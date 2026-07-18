@@ -21,7 +21,6 @@ from tools.recompiler import cpp_semantics as sem
 from tools.recompiler import ea_codegen as ea
 from tools.recompiler import opcodes
 from tools.recompiler import ccr_liveness
-from tools.recompiler import patterns
 from tools.recompiler.opcodes import Unsupported
 from tools.recompiler.ea_codegen import EAGenError, TempPool
 from tools.recompiler.regions import partition
@@ -188,12 +187,6 @@ class Generator:
         # emit_source before the second pass; _transfer skips direct calls to
         # rejected functions.
         self._rejected: set = set()
-        # Hand-written multi-instruction patterns (tools.recompiler.patterns):
-        # each registered macro substitutes a custom C++ block.  Discovery of
-        # frequent unhandled shapes is reported as suggestions for new handlers.
-        self.pattern_stats = patterns.PatternStats()
-        self.pattern_stats.suggestions = patterns.suggest_unhandled_shapes(
-            self._eff_addrs, self.ins, self.part.needs_label)
         self._build_fn_names(self._names)
         self._build_speculative_fn_names()
         self._build_label_names(self._names)
@@ -554,38 +547,7 @@ class Generator:
         live_out = ccr_liveness.analyze(
             addrs, self.ins, self.part.func_of, func.entry)
         falls_through = (FlowType.SEQUENTIAL, FlowType.CONDITIONAL, FlowType.CALL)
-        index = 0
-        while index < len(addrs):
-            hit = patterns.try_match(
-                addrs, index, self.ins, self.part.needs_label)
-            if hit is not None:
-                try:
-                    pat_lines = patterns.emit_hit(
-                        hit, live_out,
-                        needs_label=self.part.needs_label,
-                        label_name=self.label)
-                except Exception:
-                    # A broken hand-written emitter must not kill the function:
-                    # fall back to faithful per-instruction lowering.
-                    hit = None
-                else:
-                    out += [f'    {ln}' for ln in pat_lines]
-                    self.stats.handled += hit.n
-                    self.pattern_stats.note(hit)
-                    last_addr = hit.addrs[-1]
-                    last_instr = self.ins[last_addr]
-                    next_index = index + hit.n
-                    next_emitted = (addrs[next_index]
-                                    if next_index < len(addrs) else None)
-                    if (next_emitted is not None
-                            and last_instr.flow in falls_through
-                            and last_instr.next_address != next_emitted):
-                        out += [f'    {ln}' for ln in self._transfer(
-                            last_addr, last_instr.next_address)]
-                    index = next_index
-                    continue
-
-            addr = addrs[index]
+        for index, addr in enumerate(addrs):
             live = live_out.get(addr, ccr_liveness.ALL)
             out += [f'    {ln}' for ln in self._emit_instr(self.ins[addr], live)]
             instr = self.ins[addr]
@@ -594,7 +556,6 @@ class Generator:
                     and instr.next_address != next_emitted):
                 out += [f'    {ln}' for ln in self._transfer(
                     addr, instr.next_address)]
-            index += 1
         # A function whose last instruction falls through (no RTS/RTE/BRA/JMP)
         # is hand-optimized 68000 code sharing a tail with whatever comes next
         # in ROM order — real hardware just keeps executing into it. Tail-call
@@ -671,10 +632,8 @@ class Generator:
         self._rejected = rejected
         # Re-translate: _transfer now knows which targets are rejected and emits
         # dispatch() for them so their callers still link correctly.  Reset
-        # per-instruction counters so the probe pass above does not double-count.
+        # counters so the probe pass above does not double-count.
         self.stats = Stats()
-        self.pattern_stats.hits.clear()
-        self.pattern_stats.instructions.clear()
         bodies = {e: '\n'.join(self._emit_function(self.part.functions[e]))
                   for e in self.part.entries
                   if e not in rejected and e not in self._manual_functions}

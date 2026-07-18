@@ -551,8 +551,6 @@ def main(argv=None):
         top = sorted(s.stub_mnemonics.items(), key=lambda kv: -kv[1])
         print('[recompile] stubbed opcodes: ' +
               ', '.join(f'{m}×{n}' for m, n in top))
-    for line in gen.pattern_stats.summary_lines():
-        print(line)
     print(f'[recompile] wrote {args.out_dir}/Sor.hpp, {args.out_dir}/Sor.cpp')
     return 0
 
