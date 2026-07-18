@@ -916,7 +916,24 @@ def test_pattern_memfill_long_postinc_custom_loop():
 
 
 def test_unregistered_shape_is_not_auto_fused():
-    """moveq chains have no hand-written pattern → per-instruction emission."""
+    """Shapes without a catalog entry stay as per-instruction emission."""
+    # swap is a single-op data instruction with no multi-op pattern registered.
+    ins = {
+        0x100: _fn_instr(
+            0x100, 'swap', None,
+            [EA(EAMode.DATA_REG, reg=0)], bl=2),
+        0x102: _fn_instr(
+            0x102, 'swap', None,
+            [EA(EAMode.DATA_REG, reg=1)], bl=2),
+        0x104: _fn_instr(0x104, 'rts', None, [], FlowType.RETURN),
+    }
+    src = Generator(ins, {0x100}).emit_source()
+    body = _function_source(src, 'sub_000100')
+    assert 'pattern ' not in body
+    assert body.count('BEFORE_INSTRUCTION') == 3
+
+
+def test_pattern_moveq_chain():
     ins = {
         0x100: _fn_instr(
             0x100, 'moveq', None,
@@ -926,9 +943,25 @@ def test_unregistered_shape_is_not_auto_fused():
             [EA(EAMode.IMMEDIATE, imm=2), EA(EAMode.DATA_REG, reg=1)], bl=2),
         0x104: _fn_instr(0x104, 'rts', None, [], FlowType.RETURN),
     }
-    src = Generator(ins, {0x100}).emit_source()
-    body = _function_source(src, 'sub_000100')
-    assert 'pattern ' not in body
+    body = _function_source(Generator(ins, {0x100}).emit_source(), 'sub_000100')
+    assert 'pattern moveq_chain' in body
+    assert 'cpu().d[0]' in body and 'cpu().d[1]' in body
+
+
+def test_pattern_moveq_load_byte():
+    ins = {
+        0x100: _fn_instr(
+            0x100, 'moveq', None,
+            [EA(EAMode.IMMEDIATE, imm=0), EA(EAMode.DATA_REG, reg=0)], bl=2),
+        0x102: _fn_instr(
+            0x102, 'move', 'b',
+            [EA(EAMode.ADDR_DISP, reg=0, disp=80),
+             EA(EAMode.DATA_REG, reg=0)], bl=4),
+        0x106: _fn_instr(0x106, 'rts', None, [], FlowType.RETURN),
+    }
+    body = _function_source(Generator(ins, {0x100}).emit_source(), 'sub_000100')
+    assert 'pattern moveq_load_byte' in body
+    assert 'readByte' in body
     assert body.count('BEFORE_INSTRUCTION') == 3
 
 
