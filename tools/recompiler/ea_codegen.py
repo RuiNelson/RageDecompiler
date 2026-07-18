@@ -21,6 +21,7 @@ Conventions of the emitted code
 """
 
 import re
+import struct
 
 from tools.disassembler.instruction import EA, EAMode
 
@@ -35,6 +36,49 @@ _TEMP_RE = re.compile(r'^t\d+$')
 _DB_RE = re.compile(r'^cpu\(\)\.db\(\d\)$')
 _DW_RE = re.compile(r'^cpu\(\)\.dw\(\d\)$')
 _DL_RE = re.compile(r'^cpu\(\)\.(?:d\[\d\]|a\[\d\]|ssp)$')
+# Pure hex address expression as emitted by address_of / _hex.
+_CONST_ADDR_RE = re.compile(r'^0x([0-9A-Fa-f]+)u?$')
+
+# ROM image for constant-folding absolute cartridge reads (set by Generator).
+_active_rom = None
+
+
+def set_active_rom(rom) -> None:
+    """Install the ROM image used to fold constant cartridge reads, or None."""
+    global _active_rom
+    _active_rom = rom
+
+
+def parse_const_addr(expr: str) -> int | None:
+    """If *expr* is a bare hex address literal, return its 24-bit value."""
+    m = _CONST_ADDR_RE.match(expr.strip())
+    if not m:
+        return None
+    return int(m.group(1), 16) & 0xFFFFFF
+
+
+def fold_rom_read(addr: int, size: str) -> str | None:
+    """Return a C++ hex literal for a ROM peek, or None if not foldable.
+
+    Only absolute addresses that fall inside the cartridge image are folded.
+    Work RAM / I/O / odd word addresses stay as runtime ``memory()`` reads.
+    """
+    rom = _active_rom
+    if rom is None:
+        return None
+    addr &= 0xFFFFFF
+    n = SIZE_BYTES[size]
+    data = getattr(rom, '_data', None)
+    if data is None or addr + n > len(data):
+        return None
+    # Word/long must be even on the 68000.
+    if size in ('w', 'l') and (addr & 1):
+        return None
+    if size == 'b':
+        return _hex(data[addr])
+    if size == 'w':
+        return _hex(struct.unpack_from('>H', data, addr)[0])
+    return _hex(struct.unpack_from('>I', data, addr)[0])
 
 
 class EAGenError(Exception):
@@ -232,6 +276,13 @@ def read_ea(ea: EA, size: str, tmp: TempPool) -> tuple[list[str], str]:
         return stmts, v
 
     setup, addr = address_of(ea, tmp)
+    # Absolute / PC-relative cart reads with a fixed address → literal.
+    const_addr = parse_const_addr(addr)
+    if const_addr is not None:
+        folded = fold_rom_read(const_addr, size)
+        if folded is not None:
+            return list(setup), folded
+
     v = tmp.fresh(size)
     setup = list(setup)
     setup.append(f'{_CTYPE[size]} {v} = memory().{_READ_FN[size]}({addr});')
@@ -275,6 +326,16 @@ def rmw_ea(ea: EA, size: str, tmp: TempPool) -> tuple[list[str], str, list[str]]
         return pre, v, post
 
     setup, aexpr = address_of(ea, tmp)
+    const_addr = parse_const_addr(aexpr)
+    folded = (fold_rom_read(const_addr, size)
+              if const_addr is not None else None)
+    if folded is not None:
+        # Read side is a cart constant; write still goes through memory()
+        # (unusual for ROM, but keep store semantics exact).
+        pre = list(setup) + [f'{_CTYPE[size]} {v} = {folded};']
+        post = [f'memory().{_WRITE_FN[size]}({aexpr}, {v});']
+        return pre, v, post
+
     pre = setup + [f'm_long {addr} = {aexpr};',
                    f'{_CTYPE[size]} {v} = memory().{_READ_FN[size]}({addr});']
     post = [f'memory().{_WRITE_FN[size]}({addr}, {v});']

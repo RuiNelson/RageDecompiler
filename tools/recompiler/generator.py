@@ -129,9 +129,12 @@ class Generator:
     def __init__(self, instructions, subroutines, rom_path='rom/StreetsOfRage.bin',
                  names=None, speculative_addrs=None, speculative_scope=None,
                  baseline_instrs=None, manual_functions=None,
-                 confirm_addrs=None):
+                 confirm_addrs=None, rom=None):
         self.ins = instructions
         self.rom_path = rom_path
+        # Optional ROM image: absolute/PC-relative cartridge peeks are folded
+        # into C++ literals when the address is a compile-time constant.
+        self.rom = rom
         self.stats = Stats()
         self._names = names or {}
         # Phase-2 addresses determine overlapping-flow ownership. Confirmable
@@ -590,6 +593,13 @@ class Generator:
         return _HEADER_TEMPLATE.format(decls='\n'.join(decls))
 
     def emit_source(self):
+        ea.set_active_rom(self.rom)
+        try:
+            return self._emit_source_body()
+        finally:
+            ea.set_active_rom(None)
+
+    def _emit_source_body(self):
         boot = self.fn(self.part.func_of(0x000200))
         parts = [_SOURCE_PREAMBLE.format(cast_macros=sem.CAST_MACROS.strip(),
                                          rom_path=self.rom_path,

@@ -528,7 +528,8 @@ def main(argv=None):
                     speculative_scope=speculative_derived,
                     baseline_instrs=baseline_instrs,
                     manual_functions=manual_functions,
-                    confirm_addrs=confirm_entries)
+                    confirm_addrs=confirm_entries,
+                    rom=rom)
     source = gen.emit_source()   # must run first — populates self._rejected
     header = gen.emit_header()
 

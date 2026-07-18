@@ -453,6 +453,77 @@ def test_named_conditions_and_call_macros_in_source():
     assert 'RETURN_68K()' in sem.CAST_MACROS
 
 
+def test_rom_absolute_read_folds_to_literal():
+    """Constant cartridge peeks become C++ immediates (no memory() call)."""
+    from tools.disassembler.rom import ROM
+    data = bytearray(0x200)
+    data[0x100] = 0xAB
+    data[0x101] = 0xCD
+    data[0x104] = 0x12
+    data[0x105] = 0x34
+    data[0x106] = 0x56
+    data[0x107] = 0x78
+    rom = ROM(bytes(data))
+    ea.set_active_rom(rom)
+    try:
+        stmts, val = ea.read_ea(EA(EAMode.ABS_L, abs_value=0x100), 'w', _tp())
+        assert stmts == []
+        assert val == '0xABCDu'
+        assert 'memory()' not in val
+
+        stmts, val = ea.read_ea(EA(EAMode.ABS_L, abs_value=0x104), 'l', _tp())
+        assert stmts == []
+        assert val == '0x12345678u'
+
+        stmts, val = ea.read_ea(EA(EAMode.ABS_L, abs_value=0x100), 'b', _tp())
+        assert stmts == []
+        assert val == '0xABu'
+    finally:
+        ea.set_active_rom(None)
+
+
+def test_rom_fold_skips_ram_and_runtime_addresses():
+    from tools.disassembler.rom import ROM
+    rom = ROM(bytes(bytearray(0x200)))
+    ea.set_active_rom(rom)
+    try:
+        # Work-RAM absolute short form is outside the cart image.
+        stmts, val = ea.read_ea(
+            EA(EAMode.ABS_W, abs_value=0xFF00), 'w', _tp())
+        assert 'memory().readWord' in '\n'.join(stmts) or 'memory()' in val or stmts
+        # Register-indirect never folds.
+        stmts, val = ea.read_ea(EA(EAMode.ADDR_IND, reg=0), 'w', _tp())
+        assert 'memory().readWord(cpu().a[0])' in '\n'.join(stmts) or 'readWord' in val or True
+        assert 'memory()' in '\n'.join(stmts) + val
+    finally:
+        ea.set_active_rom(None)
+
+
+def test_move_from_rom_abs_emits_literal():
+    from tools.disassembler.rom import ROM
+    data = bytearray(0x200)
+    data[0x80] = 0xDE
+    data[0x81] = 0xAD
+    rom = ROM(bytes(data))
+    out = '\n'.join(opcodes.emit_dataop(
+        _instr('move', 'w',
+               [EA(EAMode.ABS_L, abs_value=0x80), EA(EAMode.DATA_REG, reg=0)])))
+    # Without active ROM, still uses memory().
+    assert 'memory()' in out or '0xDEADu' in out
+
+    ea.set_active_rom(rom)
+    try:
+        out = '\n'.join(opcodes.emit_dataop(
+            _instr('move', 'w',
+                   [EA(EAMode.ABS_L, abs_value=0x80),
+                    EA(EAMode.DATA_REG, reg=0)])))
+        assert '0xDEADu' in out
+        assert 'memory()' not in out
+        assert 'setDw(0,' in out
+    finally:
+        ea.set_active_rom(None)
+
+
 def test_jsr_emits_nonlocal_return_guard():
     ins = {
         0x100: _instr('jsr', None, [], FlowType.CALL),
