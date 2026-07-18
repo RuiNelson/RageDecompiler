@@ -14,14 +14,14 @@ come from the labels CSV when present (falling back to ``sub_XXXXXX`` /
 
 import bisect
 import re
-from collections import Counter, deque
+from collections import deque
 
 from tools.disassembler.instruction import FlowType, EAMode
 from tools.recompiler import cpp_semantics as sem
 from tools.recompiler import ea_codegen as ea
 from tools.recompiler import opcodes
 from tools.recompiler import ccr_liveness
-from tools.recompiler import sequences
+from tools.recompiler import patterns
 from tools.recompiler.opcodes import Unsupported
 from tools.recompiler.ea_codegen import EAGenError, TempPool
 from tools.recompiler.regions import partition
@@ -188,16 +188,12 @@ class Generator:
         # emit_source before the second pass; _transfer skips direct calls to
         # rejected functions.
         self._rejected: set = set()
-        # Classic 68000-style sequence macros: discover the most repeated
-        # fusible multi-instruction shapes across subroutines, then fuse them
-        # at emit time (see tools.recompiler.sequences).
-        self.seq_stats = sequences.SequenceStats()
-        self._known_patterns, pattern_counts = sequences.discover_patterns(
+        # Hand-written multi-instruction patterns (tools.recompiler.patterns):
+        # each registered macro substitutes a custom C++ block.  Discovery of
+        # frequent unhandled shapes is reported as suggestions for new handlers.
+        self.pattern_stats = patterns.PatternStats()
+        self.pattern_stats.suggestions = patterns.suggest_unhandled_shapes(
             self._eff_addrs, self.ins, self.part.needs_label)
-        # Stats show only shapes that actually qualified as macros.
-        self.seq_stats.pattern_counts = Counter(
-            {p: c for p, c in pattern_counts.items()
-             if p in self._known_patterns})
         self._build_fn_names(self._names)
         self._build_speculative_fn_names()
         self._build_label_names(self._names)
@@ -560,27 +556,25 @@ class Generator:
         falls_through = (FlowType.SEQUENTIAL, FlowType.CONDITIONAL, FlowType.CALL)
         index = 0
         while index < len(addrs):
-            match = sequences.find_match(
-                addrs, index, self.ins, self.part.needs_label,
-                self._known_patterns)
-            if match is not None:
+            hit = patterns.try_match(
+                addrs, index, self.ins, self.part.needs_label)
+            if hit is not None:
                 try:
-                    seq_lines, used_loop = sequences.emit_sequence(
-                        match, self.ins, live_out,
-                        emit_one=self._emit_data_body,
+                    pat_lines = patterns.emit_hit(
+                        hit, live_out,
                         needs_label=self.part.needs_label,
                         label_name=self.label)
-                except (Unsupported, EAGenError):
-                    # Fall back to per-instruction emission on any lowering miss
-                    # so a sequence optimiser never soft-fails a whole function.
-                    pass
+                except Exception:
+                    # A broken hand-written emitter must not kill the function:
+                    # fall back to faithful per-instruction lowering.
+                    hit = None
                 else:
-                    out += [f'    {ln}' for ln in seq_lines]
-                    self.stats.handled += len(match.addrs)
-                    self.seq_stats.note_fuse(len(match.addrs), used_loop=used_loop)
-                    last_addr = match.addrs[-1]
+                    out += [f'    {ln}' for ln in pat_lines]
+                    self.stats.handled += hit.n
+                    self.pattern_stats.note(hit)
+                    last_addr = hit.addrs[-1]
                     last_instr = self.ins[last_addr]
-                    next_index = index + len(match.addrs)
+                    next_index = index + hit.n
                     next_emitted = (addrs[next_index]
                                     if next_index < len(addrs) else None)
                     if (next_emitted is not None
@@ -615,17 +609,6 @@ class Generator:
             out.append('    return;')
         out.append('}')
         return out
-
-    def _emit_data_body(self, instr, live_out=None):
-        """Body statements of one data op (no braces / BEFORE / labels)."""
-        if instr.mnemonic == 'nop':
-            return ['(void)0;']
-        if instr.mnemonic == 'movem':
-            return self._emit_movem(instr)
-        body = opcodes.emit_dataop(instr, live_flags=live_out)
-        if body is None:
-            raise Unsupported(instr.mnemonic)
-        return body
 
     def _emit_speculative_wrapper(self, addr):
         """Emit one exact-address entry function without duplicating its body."""
@@ -690,9 +673,8 @@ class Generator:
         # dispatch() for them so their callers still link correctly.  Reset
         # per-instruction counters so the probe pass above does not double-count.
         self.stats = Stats()
-        self.seq_stats.fused_sequences = 0
-        self.seq_stats.fused_instructions = 0
-        self.seq_stats.loop_sequences = 0
+        self.pattern_stats.hits.clear()
+        self.pattern_stats.instructions.clear()
         bodies = {e: '\n'.join(self._emit_function(self.part.functions[e]))
                   for e in self.part.entries
                   if e not in rejected and e not in self._manual_functions}

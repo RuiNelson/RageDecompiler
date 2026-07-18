@@ -851,10 +851,10 @@ def test_manual_function_keeps_declaration_calls_and_dispatch_but_omits_body():
     assert 'void Sor::manual_wait(' not in source
 
 
-# --- sequence macros (repeated multi-instruction patterns) ----------------
+# --- hand-written multi-instruction patterns ------------------------------
 
 def _seq_move_imm_b_disp(addr, imm, disp, an=0, bl=4):
-    """move.b #imm, disp(An) — common structure-init shape."""
+    """move.b #imm, disp(An) — structure-init shape (imm_disp_store_chain)."""
     return _fn_instr(
         addr, 'move', 'b',
         [EA(EAMode.IMMEDIATE, imm=imm),
@@ -862,59 +862,43 @@ def _seq_move_imm_b_disp(addr, imm, disp, an=0, bl=4):
         bl=bl)
 
 
-def test_sequence_fuses_repeated_imm_disp_stores():
-    """Frequent move.b #imm,d16(An) pairs fuse into one seq block."""
-    # Five functions with the same 2-op shape → pattern discovery qualifies it.
-    ins = {}
-    entries = set()
-    for base in (0x100, 0x200, 0x300, 0x400, 0x500):
-        ins[base] = _seq_move_imm_b_disp(base, 1, 0)
-        ins[base + 4] = _seq_move_imm_b_disp(base + 4, 2, 1)
-        ins[base + 8] = _fn_instr(base + 8, 'rts', None, [], FlowType.RETURN)
-        entries.add(base)
-
-    src = Generator(ins, entries).emit_source()
+def test_pattern_imm_disp_store_chain_custom_block():
+    """Registered imm_disp_store_chain replaces the sequence with custom C++."""
+    ins = {
+        0x100: _seq_move_imm_b_disp(0x100, 1, 0),
+        0x104: _seq_move_imm_b_disp(0x104, 2, 1),
+        0x108: _fn_instr(0x108, 'rts', None, [], FlowType.RETURN),
+    }
+    src = Generator(ins, {0x100}).emit_source()
     body = _function_source(src, 'sub_000100')
-    assert 'seq $000100–$000104' in body
-    assert body.count('BEFORE_INSTRUCTION') == 3  # 2 fused + rts
-    # Data still written; intermediate flags stay dead-omitted.
+    assert 'pattern imm_disp_store_chain' in body
+    assert body.count('BEFORE_INSTRUCTION') == 3  # 2 stores + rts
     assert 'writeByte' in body
     assert body.count('setNZ') <= 1
 
 
-def test_sequence_never_fuses_across_label():
-    """A mid-sequence goto target forces a hard split (zero danger)."""
-    ins = {}
-    entries = set()
-    # Enough copies of the shape for discovery (no mid-labels).
-    for base in (0x200, 0x300, 0x400, 0x500, 0x600):
-        ins[base] = _seq_move_imm_b_disp(base, 1, 0)
-        ins[base + 4] = _seq_move_imm_b_disp(base + 4, 2, 1)
-        ins[base + 8] = _fn_instr(base + 8, 'rts', None, [], FlowType.RETURN)
-        entries.add(base)
-    # Function under test: beq targets the second move → label barrier.
-    # 0x100 beq → 0x106; 0x102 move; 0x106 move (label); 0x10A rts
-    ins[0x100] = _fn_instr(0x100, 'beq', None, [], FlowType.CONDITIONAL,
-                           targets=[0x106], bl=2)
-    ins[0x102] = _seq_move_imm_b_disp(0x102, 1, 0, bl=4)
-    ins[0x106] = _seq_move_imm_b_disp(0x106, 2, 1, bl=4)
-    ins[0x10A] = _fn_instr(0x10A, 'rts', None, [], FlowType.RETURN)
-    entries.add(0x100)
-
-    src = Generator(ins, entries).emit_source()
+def test_pattern_never_matches_across_label():
+    """A mid-sequence goto target blocks matching (zero danger)."""
+    ins = {
+        0x100: _fn_instr(0x100, 'beq', None, [], FlowType.CONDITIONAL,
+                         targets=[0x106], bl=2),
+        0x102: _seq_move_imm_b_disp(0x102, 1, 0, bl=4),
+        0x106: _seq_move_imm_b_disp(0x106, 2, 1, bl=4),
+        0x10A: _fn_instr(0x10A, 'rts', None, [], FlowType.RETURN),
+    }
+    src = Generator(ins, {0x100}).emit_source()
     body = _function_source(src, 'sub_000100')
     assert 'goto L000106' in body
     assert 'L000106:' in body
-    # Pair 0x102/0x106 cannot fuse: 0x106 is a branch target.
-    assert 'seq $000102–$000106' not in body
+    assert 'pattern imm_disp_store_chain $000102' not in body
 
 
-def test_sequence_identical_fill_emits_loop():
-    """N≥4 identical move.l Dn,(An)+ collapses to a for-loop with N× BEFORE."""
+def test_pattern_memfill_long_postinc_custom_loop():
+    """Registered memfill_long_postinc emits a hand-written for-loop."""
     n = 4
     ins = {}
     addr = 0x100
-    for i in range(n):
+    for _ in range(n):
         ins[addr] = _fn_instr(
             addr, 'move', 'l',
             [EA(EAMode.DATA_REG, reg=1),
@@ -925,28 +909,65 @@ def test_sequence_identical_fill_emits_loop():
 
     src = Generator(ins, {0x100}).emit_source()
     body = _function_source(src, 'sub_000100')
+    assert 'pattern memfill_long_postinc' in body
     assert 'for (int _seq = 0; _seq < 4; ++_seq)' in body
-    # Source has one BEFORE inside the loop (runs 4×) plus rts.
-    assert body.count('BEFORE_INSTRUCTION') == 2
+    assert body.count('BEFORE_INSTRUCTION') == 2  # loop body + rts
     assert 'writeLong' in body
-    assert 'cpu().a[1] += 4' in body or 'cpu().a[1] += 4;' in body
 
 
-def test_sequence_preserves_before_count_on_fused_pair():
-    """IRQ/pace checks stay 1:1 with original opcodes after fusion."""
-    ins = {}
-    entries = set()
-    for base in (0x100, 0x200, 0x300, 0x400, 0x500):
-        ins[base] = _fn_instr(
-            base, 'moveq', None,
-            [EA(EAMode.IMMEDIATE, imm=1), EA(EAMode.DATA_REG, reg=0)], bl=2)
-        ins[base + 2] = _fn_instr(
-            base + 2, 'moveq', None,
-            [EA(EAMode.IMMEDIATE, imm=2), EA(EAMode.DATA_REG, reg=1)], bl=2)
-        ins[base + 4] = _fn_instr(base + 4, 'rts', None, [], FlowType.RETURN)
-        entries.add(base)
-
-    src = Generator(ins, entries).emit_source()
+def test_unregistered_shape_is_not_auto_fused():
+    """moveq chains have no hand-written pattern → per-instruction emission."""
+    ins = {
+        0x100: _fn_instr(
+            0x100, 'moveq', None,
+            [EA(EAMode.IMMEDIATE, imm=1), EA(EAMode.DATA_REG, reg=0)], bl=2),
+        0x102: _fn_instr(
+            0x102, 'moveq', None,
+            [EA(EAMode.IMMEDIATE, imm=2), EA(EAMode.DATA_REG, reg=1)], bl=2),
+        0x104: _fn_instr(0x104, 'rts', None, [], FlowType.RETURN),
+    }
+    src = Generator(ins, {0x100}).emit_source()
     body = _function_source(src, 'sub_000100')
-    # two moveq + rts
+    assert 'pattern ' not in body
     assert body.count('BEFORE_INSTRUCTION') == 3
+
+
+def test_custom_pattern_registration():
+    """New patterns can be registered and emit arbitrary C++."""
+    from tools.recompiler import patterns as pat
+
+    def match_two_nops(instrs):
+        if (len(instrs) >= 2
+                and instrs[0].mnemonic == 'nop'
+                and instrs[1].mnemonic == 'nop'):
+            return 2, {}
+        return None
+
+    def emit_two_nops(m, live_out):
+        return [
+            'BEFORE_INSTRUCTION',
+            'BEFORE_INSTRUCTION',
+            '/* custom double-nop */ (void)0;',
+        ]
+
+    custom = pat.Pattern(
+        name='test_double_nop',
+        doc='unit-test only',
+        match=match_two_nops,
+        emit=emit_two_nops,
+    )
+    # Temporarily install just this pattern.
+    old = list(pat.PATTERNS)
+    pat.PATTERNS[:] = [custom]
+    try:
+        ins = {
+            0x100: _fn_instr(0x100, 'nop', None, [], bl=2),
+            0x102: _fn_instr(0x102, 'nop', None, [], bl=2),
+            0x104: _fn_instr(0x104, 'rts', None, [], FlowType.RETURN),
+        }
+        src = Generator(ins, {0x100}).emit_source()
+        body = _function_source(src, 'sub_000100')
+        assert 'pattern test_double_nop' in body
+        assert 'custom double-nop' in body
+    finally:
+        pat.PATTERNS[:] = old
