@@ -31,14 +31,17 @@ class EAGenError(Exception):
 
 
 class TempPool:
-    """Hands out unique temporary names within one instruction's emission."""
+    """Hands out unique temporary names within one instruction's emission.
 
-    def __init__(self, addr: int) -> None:
-        self._prefix = f't{addr:06x}_'
+    Names are short (``t0``, ``t1``, …): each instruction gets its own pool, so
+    address-tagged prefixes only added visual noise in the generated source.
+    """
+
+    def __init__(self, addr: int = 0) -> None:
         self._n = 0
 
     def fresh(self) -> str:
-        name = f'{self._prefix}{self._n}'
+        name = f't{self._n}'
         self._n += 1
         return name
 
@@ -51,6 +54,14 @@ def _hex(value: int) -> str:
     if v <= 0xFFFF:
         return f'0x{v:04X}u'
     return f'0x{v:08X}u'
+
+
+def _cast(size: str, value: str) -> str:
+    """Apply BYTE/WORD/LONG only when *value* is not already so cast."""
+    cast = _CAST[size]
+    if value.startswith(f'{cast}('):
+        return value
+    return f'{cast}({value})'
 
 
 def areg(n: int) -> str:
@@ -78,21 +89,21 @@ def write_dn(n: int, size: str, value: str) -> str:
     """Statement writing ``value`` into Dn, preserving untouched high bits."""
     if size == 'b':
         return (f'cpu().d[{n}] = LONG((cpu().d[{n}] & 0xFFFFFF00u) '
-                f'| LONG(BYTE({value})));')
+                f'| LONG({_cast("b", value)}));')
     if size == 'w':
         return (f'cpu().d[{n}] = LONG((cpu().d[{n}] & 0xFFFF0000u) '
-                f'| LONG(WORD({value})));')
-    return f'cpu().d[{n}] = LONG({value});'
+                f'| LONG({_cast("w", value)}));')
+    return f'cpu().d[{n}] = {_cast("l", value)};'
 
 
 def write_areg_word(ar: str, value: str) -> str:
     """Word write to An — sign-extend bit 15 (movea / lea)."""
     return (f'{ar} = LONG(static_cast<int32_t>('
-            f'static_cast<int16_t>(WORD({value}))));')
+            f'static_cast<int16_t>({_cast("w", value)})));')
 
 
 def write_areg_long(ar: str, value: str) -> str:
-    return f'{ar} = LONG({value});'
+    return f'{ar} = {_cast("l", value)};'
 
 
 def signext_to_long(expr: str, size: str) -> str:
@@ -100,9 +111,9 @@ def signext_to_long(expr: str, size: str) -> str:
         return expr
     if size == 'w':
         return (f'LONG(static_cast<int32_t>('
-                f'static_cast<int16_t>(WORD({expr}))))')
+                f'static_cast<int16_t>({_cast("w", expr)})))')
     return (f'LONG(static_cast<int32_t>('
-            f'static_cast<int8_t>(BYTE({expr}))))')
+            f'static_cast<int8_t>({_cast("b", expr)})))')
 
 
 def _index_expr(ea: EA) -> str:
@@ -119,9 +130,14 @@ def address_of(ea: EA, tmp: TempPool) -> tuple[list[str], str]:
     if ea.mode == EAMode.ADDR_IND:
         return [], areg(ea.reg)
     if ea.mode == EAMode.ADDR_DISP:
+        if not ea.disp:
+            return [], areg(ea.reg)
         return [], f'({areg(ea.reg)} + {ea.disp})'
     if ea.mode == EAMode.ADDR_INDEX:
-        return [], f'({areg(ea.reg)} + {ea.disp} + {_index_expr(ea)})'
+        idx = _index_expr(ea)
+        if not ea.disp:
+            return [], f'({areg(ea.reg)} + {idx})'
+        return [], f'({areg(ea.reg)} + {ea.disp} + {idx})'
     if ea.mode == EAMode.ABS_W:
         v = ea.abs_value & 0xFFFF
         return [], _hex(v | 0xFFFF0000 if (v & 0x8000) else v)

@@ -158,6 +158,25 @@ def test_moveq_long_signext_and_flags():
     out = '\n'.join(opcodes.emit_dataop(_instr(
         'moveq', None, [EA(EAMode.IMMEDIATE, imm=-1), EA(EAMode.DATA_REG, reg=0)])))
     assert 'cpu().d[0]' in out and 'cpu().setNZClearVC' in out
+    # Compact: sign-extended literal, no nested int8/int32 casts.
+    assert '0xFFFFFFFFu' in out
+    assert 'static_cast<int8_t>' not in out
+
+
+def test_move_does_not_copy_already_materialized_temp():
+    """move.b (a0)+, d0 must not emit a redundant t1 = t0."""
+    out = '\n'.join(opcodes.emit_dataop(_instr(
+        'move', 'b',
+        [EA(EAMode.ADDR_POSTINC, reg=0), EA(EAMode.DATA_REG, reg=1)])))
+    assert 'cpu().a[0] += 1;' in out
+    assert out.count('m_byte t') == 1  # one temp from postinc, not a second copy
+
+
+def test_disp_zero_omits_plus_zero():
+    setup, addr = ea.address_of(EA(EAMode.ADDR_DISP, reg=1, disp=0), _tp())
+    assert setup == []
+    assert addr == 'cpu().a[1]'
+    assert '+ 0' not in addr
 
 
 def test_move_special_registers_use_cpu_sr_helpers():

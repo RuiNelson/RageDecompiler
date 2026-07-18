@@ -228,8 +228,9 @@ def cmpa(dst: str, src: str, size: str, tmp, live=None) -> list[str]:
 
 def logic_op(dst: str, src: str, size: str, op: str, live=None) -> list[str]:
     c_op = {'AND': '&', 'OR': '|', 'EOR': '^'}[op]
+    # src is already size-correct from read_ea / immediates — one cast is enough.
     return [
-        f'{dst} = {_CAST[size]}({dst} {c_op} {_CAST[size]}({src}));',
+        f'{dst} = {_CAST[size]}({dst} {c_op} {src});',
         *logical(dst, size, live=live),
     ]
 

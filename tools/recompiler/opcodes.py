@@ -126,20 +126,19 @@ def _move(instr, tmp, live=None):
         if size == 'b':
             raise Unsupported('movea.b')           # invalid on 68000
         return stmts + sem.movea(ea.areg(dst.reg), val, size)
-    r = tmp.fresh()
-    stmts.append(f'{ea._CTYPE[size]} {r} = {val};')
-    stmts += ea.write_ea(dst, size, r, tmp)
-    return stmts + sem.move(r, size, live=live)
+    # Use the EA value directly — read_ea already materializes side effects
+    # into a temp when needed; a second t1 = t0 copy only adds noise.
+    stmts = list(stmts)
+    stmts += ea.write_ea(dst, size, val, tmp)
+    return stmts + sem.move(val, size, live=live)
 
 
 def _moveq(instr, tmp, live=None):
     src, dst = instr.eas[0], instr.eas[1]
-    r = tmp.fresh()
     imm = src.imm & 0xFF
-    return [
-        f'm_long {r} = LONG(static_cast<int32_t>(static_cast<int8_t>({imm})));',
-        ea.write_dn(dst.reg, 'l', r),
-    ] + sem.move(r, 'l', live=live)
+    # Sign-extend the 8-bit immediate to 32 bits as a single hex literal.
+    val = ea._hex(imm if imm < 0x80 else (imm | 0xFFFFFF00))
+    return [ea.write_dn(dst.reg, 'l', val)] + sem.move(val, 'l', live=live)
 
 
 def _arith(instr, tmp, op, live=None):
