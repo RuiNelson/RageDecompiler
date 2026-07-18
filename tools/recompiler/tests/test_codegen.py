@@ -101,11 +101,16 @@ def test_write_subregister_uses_merge_helpers():
         ['cpu().setDb(2, BYTE(v));']
     assert ea.write_ea(EA(EAMode.DATA_REG, reg=2), 'w', 'v', _tp()) == \
         ['cpu().setDw(2, WORD(v));']
+    # Typed temps / immediates skip the redundant cast wrapper.
+    tp = _tp()
+    t = tp.fresh('w')
+    assert ea.write_dn(2, 'w', t, tp.types) == f'cpu().setDw(2, {t});'
+    assert ea.write_dn(2, 'w', '0x8000u', tp.types) == 'cpu().setDw(2, 0x8000u);'
 
 
 def test_write_addr_reg_word_sign_extends():
     out = ea.write_ea(EA(EAMode.ADDR_REG, reg=4), 'w', 'v', _tp())[0]
-    assert 'static_cast<int32_t>' in out
+    assert 'SEX_W(' in out
     assert 'cpu().a[4]' in out
 
 
@@ -135,7 +140,7 @@ def test_movea_no_flags_sign_extends():
         'move', 'w', [EA(EAMode.DATA_REG, reg=0), EA(EAMode.ADDR_REG, reg=1)])))
     assert 'setCCR' not in out and 'setFlag' not in out  # movea never touches CCR
     assert 'cpu().a[1]' in out                   # word source sign-extended
-    assert 'static_cast<int16_t>' in out
+    assert 'SEX_W(cpu().dw(0))' in out
 
 
 def test_move_word_to_data_reg_preserves_high_word():
@@ -187,7 +192,7 @@ def test_move_special_registers_use_cpu_sr_helpers():
         'move', 'w', [EA(EAMode.IMMEDIATE, imm=0x1F), EA(EAMode.SPECIAL_REG, special='ccr')])))
 
     assert 'cpu().status()' in from_sr
-    assert 'cpu().setCCR(WORD(' in to_ccr
+    assert 'cpu().setCCR(0x1Fu)' in to_ccr
     assert 'cpu().sr' not in from_sr
     assert 'cpu().sr' not in to_ccr
 
@@ -225,7 +230,7 @@ def test_cmp_sets_flags_without_writing():
 def test_adda_is_address_arith_no_flags():
     out = '\n'.join(opcodes.emit_dataop(_instr(
         'adda', 'l', [EA(EAMode.DATA_REG, reg=0), EA(EAMode.ADDR_REG, reg=1)])))
-    assert 'cpu().a[1] = LONG(cpu().a[1] +' in out
+    assert 'cpu().a[1] = cpu().a[1] + cpu().d[0]' in out
     assert 'setCCR' not in out and 'setFlag' not in out
 
 
@@ -268,8 +273,8 @@ def test_movem_word_load_sign_extends_into_data_reg():
     out = '\n'.join(gen._emit_movem(_instr(
         'movem', 'w',
         [EA(EAMode.ADDR_POSTINC, reg=0), EA(EAMode.DATA_REG, reg=2)])))
-    assert 'static_cast<int16_t>' in out       # sign-extended…
-    assert 'cpu().d[2] = LONG(' in out         # …into the full register
+    assert 'SEX_W(' in out                     # sign-extended…
+    assert 'cpu().d[2] =' in out               # …into the full register
     assert '0xFFFF0000u' not in out            # no preserve-high merge
 
 
@@ -370,8 +375,8 @@ def test_dead_move_flags_omitted_before_overwriting_move():
     src = Generator(ins, {0x100}).emit_source()
     body = _function_source(src, 'sub_000100')
     # Data moves still happen…
-    assert 'cpu().d[1] = LONG(' in body
-    assert 'cpu().d[3] = LONG(' in body
+    assert 'cpu().d[1] =' in body
+    assert 'cpu().d[3] =' in body
     # …but only the second move updates flags (escape via rts).
     assert body.count('setNZClearVC') == 1
     first_move = body.split('// $000100')[1].split('// $000102')[0]

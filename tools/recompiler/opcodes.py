@@ -92,11 +92,11 @@ def _special_src_expr(e):
 
 def _special_write(e, value):
     if e.special == 'sr':
-        return [f'cpu().setStatus(WORD({value}));']
+        return [f'cpu().setStatus({ea._cast("w", value)});']
     if e.special == 'ccr':
-        return [f'cpu().setCCR(WORD({value}));']
+        return [f'cpu().setCCR({ea._cast("w", value)});']
     if e.special == 'usp':
-        return [f'cpu().usp = LONG({value});']
+        return [f'cpu().usp = {ea._cast("l", value)};']
     raise EAGenError(f'write to special register {e.special}')
 
 
@@ -125,7 +125,7 @@ def _move(instr, tmp, live=None):
     if dst.mode == EAMode.ADDR_REG:                # movea — sign-extend, no flags
         if size == 'b':
             raise Unsupported('movea.b')           # invalid on 68000
-        return stmts + sem.movea(ea.areg(dst.reg), val, size)
+        return stmts + sem.movea(ea.areg(dst.reg), val, size, tmp)
     # Use the EA value directly — read_ea already materializes side effects
     # into a temp when needed; a second t1 = t0 copy only adds noise.
     stmts = list(stmts)
@@ -153,8 +153,8 @@ def _arith(instr, tmp, op, live=None):
         ar = ea.areg(dst.reg)
         if op == 'CMP':
             return s_stmts + sem.cmpa(ar, sval, size, tmp, live=live)
-        return s_stmts + (sem.adda(ar, sval, size) if op == 'ADD'
-                          else sem.suba(ar, sval, size))
+        return s_stmts + (sem.adda(ar, sval, size, tmp) if op == 'ADD'
+                          else sem.suba(ar, sval, size, tmp))
 
     if op == 'CMP':
         # When all compare flags are dead, skip the compare entirely and only
@@ -188,7 +188,7 @@ def _logic(instr, tmp, op, live=None):
         return s_stmts + _special_write(dst, f'({cur} {cxx} {sval})')
     s_stmts, sval = ea.read_ea(src, size, tmp)
     pre, r, post = ea.rmw_ea(dst, size, tmp)
-    return s_stmts + pre + sem.logic_op(r, sval, size, op, live=live) + post
+    return s_stmts + pre + sem.logic_op(r, sval, size, op, live=live, tmp=tmp) + post
 
 
 def _and(instr, tmp, live=None): return _logic(instr, tmp, 'AND', live)
@@ -227,14 +227,14 @@ def _clr(instr, tmp, live=None):
 def _lea(instr, tmp, live=None):
     src, dst = instr.eas[0], instr.eas[1]
     setup, addr = ea.address_of(src, tmp)
-    return setup + [f'{ea.areg(dst.reg)} = LONG({addr});']
+    return setup + [f'{ea.areg(dst.reg)} = {ea._cast("l", addr)};']
 
 
 def _pea(instr, tmp, live=None):
     setup, addr = ea.address_of(instr.eas[0], tmp)
     return setup + [
         'cpu().ssp -= 4;',
-        f'memory().writeLong(cpu().ssp, LONG({addr}));',
+        f'memory().writeLong(cpu().ssp, {ea._cast("l", addr)});',
     ]
 
 
@@ -243,7 +243,7 @@ def _unary(instr, tmp, macro, live=None):
     size = _sized(instr)
     pre, r, post = ea.rmw_ea(instr.eas[0], size, tmp)
     op = (sem.neg(r, size, tmp, live=live) if macro == 'NEG'
-          else sem.not_op(r, size, live=live))
+          else sem.not_op(r, size, live=live, tmp=tmp))
     return pre + op + post
 
 
@@ -306,9 +306,9 @@ def _bitop(instr, tmp, kind, live=None):
         bit = f'(cpu().d[{bit_ea.reg}] % {modulo})'
     if kind == 'BTST':
         stmts, val = ea.read_ea(dst, size, tmp)
-        return stmts + sem.bitop(val, bit, kind, size, live=live)
+        return stmts + sem.bitop(val, bit, kind, size, live=live, tmp=tmp)
     pre, r, post = ea.rmw_ea(dst, size, tmp)
-    return pre + sem.bitop(r, bit, kind, size, live=live) + post
+    return pre + sem.bitop(r, bit, kind, size, live=live, tmp=tmp) + post
 
 
 def _scc(instr, tmp, cc):

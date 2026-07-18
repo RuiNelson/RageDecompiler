@@ -11,11 +11,16 @@ Conventions of the emitted code
 * Data registers use ``cpu().d[n]`` for long and ``cpu().db/dw/setDb/setDw``
   for byte/word (merge-on-write helpers on ``CPU68K``).
 * Address registers use ``cpu().a[n]`` / ``cpu().ssp`` (A7); word writes sign-
-  extend to 32 bits (movea / lea rule).
+  extend to 32 bits via ``SEX_W`` / ``SEX_B`` (movea / lea rule).
 * Memory is reached through ``memory()`` (``SystemMemory``):
   ``readByte/Word/Long`` and ``writeByte/Word/Long``. ``SystemMemory`` masks
   every address to 24 bits, so the generator never masks.
+* Casts (``BYTE``/``WORD``/``LONG``) are emitted only when the expression's
+  known type differs from the needed width — typed temps, ``db``/``dw``, and
+  bare hex immediates are left alone.
 """
+
+import re
 
 from tools.disassembler.instruction import EA, EAMode
 
@@ -25,6 +30,12 @@ _WRITE_FN  = {'b': 'writeByte', 'w': 'writeWord', 'l': 'writeLong'}
 _CTYPE     = {'b': 'm_byte', 'w': 'm_word', 'l': 'm_long'}
 _CAST      = {'b': 'BYTE', 'w': 'WORD', 'l': 'LONG'}
 
+_IMM_RE = re.compile(r'^(?:0x[0-9A-Fa-f]+|\d+)u?$')
+_TEMP_RE = re.compile(r'^t\d+$')
+_DB_RE = re.compile(r'^cpu\(\)\.db\(\d\)$')
+_DW_RE = re.compile(r'^cpu\(\)\.dw\(\d\)$')
+_DL_RE = re.compile(r'^cpu\(\)\.(?:d\[\d\]|a\[\d\]|ssp)$')
+
 
 class EAGenError(Exception):
     """An EA that this generator cannot translate (e.g. RAW fallback)."""
@@ -33,16 +44,19 @@ class EAGenError(Exception):
 class TempPool:
     """Hands out unique temporary names within one instruction's emission.
 
-    Names are short (``t0``, ``t1``, …): each instruction gets its own pool, so
-    address-tagged prefixes only added visual noise in the generated source.
+    Names are short (``t0``, ``t1``, …).  Optional size tags feed the cast
+    elider so ``setDw(0, t0)`` need not wrap an already-``m_word`` temp.
     """
 
     def __init__(self, addr: int = 0) -> None:
         self._n = 0
+        self.types: dict[str, str] = {}
 
-    def fresh(self) -> str:
+    def fresh(self, size: str | None = None) -> str:
         name = f't{self._n}'
         self._n += 1
+        if size in _CTYPE:
+            self.types[name] = size
         return name
 
 
@@ -56,12 +70,42 @@ def _hex(value: int) -> str:
     return f'0x{v:08X}u'
 
 
-def _cast(size: str, value: str) -> str:
-    """Apply BYTE/WORD/LONG only when *value* is not already so cast."""
+def expr_size(value: str, types: dict[str, str] | None = None) -> str | None:
+    """Best-effort size tag for *value*, or None if unknown."""
+    e = value.strip()
+    if e.startswith('BYTE('):
+        return 'b'
+    if e.startswith('WORD('):
+        return 'w'
+    if e.startswith('LONG(') or e.startswith('SEX_W(') or e.startswith('SEX_B('):
+        return 'l'
+    if _DB_RE.match(e):
+        return 'b'
+    if _DW_RE.match(e):
+        return 'w'
+    if _DL_RE.match(e):
+        return 'l'
+    if types and _TEMP_RE.match(e):
+        return types.get(e)
+    if _IMM_RE.match(e):
+        return 'imm'
+    return None
+
+
+def _cast(size: str, value: str, types: dict[str, str] | None = None) -> str:
+    """Apply BYTE/WORD/LONG only when the expression is not already that width.
+
+    Immediates and same-sized temps/registers are returned unchanged — the C++
+    assignment or ``setDb``/``setDw`` parameter type does the conversion.
+    """
+    e = value.strip()
     cast = _CAST[size]
-    if value.startswith(f'{cast}('):
-        return value
-    return f'{cast}({value})'
+    if e.startswith(f'{cast}('):
+        return e
+    known = expr_size(e, types)
+    if known == size or known == 'imm':
+        return e
+    return f'{cast}({e})'
 
 
 def areg(n: int) -> str:
@@ -85,42 +129,46 @@ def read_dn(n: int, size: str) -> str:
     return f'cpu().d[{n}]'
 
 
-def write_dn(n: int, size: str, value: str) -> str:
+def write_dn(n: int, size: str, value: str,
+             types: dict[str, str] | None = None) -> str:
     """Statement writing ``value`` into Dn, preserving untouched high bits."""
     if size == 'b':
-        return f'cpu().setDb({n}, {_cast("b", value)});'
+        return f'cpu().setDb({n}, {_cast("b", value, types)});'
     if size == 'w':
-        return f'cpu().setDw({n}, {_cast("w", value)});'
-    return f'cpu().d[{n}] = {_cast("l", value)};'
+        return f'cpu().setDw({n}, {_cast("w", value, types)});'
+    return f'cpu().d[{n}] = {_cast("l", value, types)};'
 
 
-def write_areg_word(ar: str, value: str) -> str:
+def write_areg_word(ar: str, value: str,
+                    types: dict[str, str] | None = None) -> str:
     """Word write to An — sign-extend bit 15 (movea / lea)."""
-    return (f'{ar} = LONG(static_cast<int32_t>('
-            f'static_cast<int16_t>({_cast("w", value)})));')
+    return f'{ar} = SEX_W({_cast("w", value, types)});'
 
 
-def write_areg_long(ar: str, value: str) -> str:
-    return f'{ar} = {_cast("l", value)};'
+def write_areg_long(ar: str, value: str,
+                    types: dict[str, str] | None = None) -> str:
+    return f'{ar} = {_cast("l", value, types)};'
 
 
-def signext_to_long(expr: str, size: str) -> str:
+def signext_to_long(expr: str, size: str,
+                    types: dict[str, str] | None = None) -> str:
     if size == 'l':
-        return expr
+        return _cast('l', expr, types)
     if size == 'w':
-        return (f'LONG(static_cast<int32_t>('
-                f'static_cast<int16_t>({_cast("w", expr)})))')
-    return (f'LONG(static_cast<int32_t>('
-            f'static_cast<int8_t>({_cast("b", expr)})))')
+        return f'SEX_W({_cast("w", expr, types)})'
+    return f'SEX_B({_cast("b", expr, types)})'
 
 
 def _index_expr(ea: EA) -> str:
     """C++ expression for the (sign-extended) index register of an indexed EA."""
-    reg = areg(ea.index_reg) if ea.index_is_addr else f'cpu().d[{ea.index_reg}]'
+    if ea.index_is_addr:
+        reg = areg(ea.index_reg)
+        if ea.index_size == 'w':
+            return f'SEX_W({reg} & 0xFFFFu)'
+        return reg
     if ea.index_size == 'w':
-        return (f'LONG(static_cast<int32_t>('
-                f'static_cast<int16_t>(WORD({reg} & 0xFFFFu))))')
-    return reg
+        return f'SEX_W(cpu().dw({ea.index_reg}))'
+    return f'cpu().d[{ea.index_reg}]'
 
 
 def address_of(ea: EA, tmp: TempPool) -> tuple[list[str], str]:
@@ -157,14 +205,16 @@ def read_ea(ea: EA, size: str, tmp: TempPool) -> tuple[list[str], str]:
         if size == 'l':
             return [], areg(ea.reg)
         if size == 'w':
+            # Low 16 bits of An; keep an explicit mask (not a Dn helper).
             return [], f'WORD({areg(ea.reg)} & 0xFFFFu)'
         return [], f'BYTE({areg(ea.reg)} & 0xFFu)'
 
     if ea.mode == EAMode.IMMEDIATE:
-        return [], f'{_CAST[size]}({_hex(ea.imm)})'
+        # Bare hex — callers cast only when the value must change width.
+        return [], _hex(ea.imm)
 
     if ea.mode == EAMode.ADDR_POSTINC:
-        v = tmp.fresh()
+        v = tmp.fresh(size)
         step = addr_step(ea.reg, size)
         stmts = [
             f'{_CTYPE[size]} {v} = memory().{_READ_FN[size]}({areg(ea.reg)});',
@@ -173,7 +223,7 @@ def read_ea(ea: EA, size: str, tmp: TempPool) -> tuple[list[str], str]:
         return stmts, v
 
     if ea.mode == EAMode.ADDR_PREDEC:
-        v = tmp.fresh()
+        v = tmp.fresh(size)
         step = addr_step(ea.reg, size)
         stmts = [
             f'{areg(ea.reg)} -= {step};',
@@ -182,7 +232,7 @@ def read_ea(ea: EA, size: str, tmp: TempPool) -> tuple[list[str], str]:
         return stmts, v
 
     setup, addr = address_of(ea, tmp)
-    v = tmp.fresh()
+    v = tmp.fresh(size)
     setup = list(setup)
     setup.append(f'{_CTYPE[size]} {v} = memory().{_READ_FN[size]}({addr});')
     return setup, v
@@ -190,26 +240,27 @@ def read_ea(ea: EA, size: str, tmp: TempPool) -> tuple[list[str], str]:
 
 def rmw_ea(ea: EA, size: str, tmp: TempPool) -> tuple[list[str], str, list[str]]:
     """Read-modify-write access: (pre, value_temp, post)."""
+    types = tmp.types
     if ea.mode == EAMode.DATA_REG:
-        v = tmp.fresh()
+        v = tmp.fresh(size)
         return ([f'{_CTYPE[size]} {v} = {read_dn(ea.reg, size)};'],
-                v, [write_dn(ea.reg, size, v)])
+                v, [write_dn(ea.reg, size, v, types)])
 
     if ea.mode == EAMode.ADDR_REG:
         # No 68000 opcode does a byte/word read-modify-write on An.
         if size != 'l':
             raise EAGenError(f'{size}-size read-modify-write on an address register')
-        v = tmp.fresh()
+        v = tmp.fresh('l')
         return ([f'm_long {v} = {areg(ea.reg)};'],
-                v, [write_areg_long(areg(ea.reg), v)])
+                v, [write_areg_long(areg(ea.reg), v, types)])
 
     bytes_ = (
         addr_step(ea.reg, size)
         if ea.mode in (EAMode.ADDR_POSTINC, EAMode.ADDR_PREDEC)
         else SIZE_BYTES[size]
     )
-    addr = tmp.fresh()
-    v = tmp.fresh()
+    addr = tmp.fresh('l')
+    v = tmp.fresh(size)
     if ea.mode == EAMode.ADDR_POSTINC:
         pre = [f'm_long {addr} = {areg(ea.reg)};',
                f'{_CTYPE[size]} {v} = memory().{_READ_FN[size]}({addr});']
@@ -232,21 +283,23 @@ def rmw_ea(ea: EA, size: str, tmp: TempPool) -> tuple[list[str], str, list[str]]
 
 def write_ea(ea: EA, size: str, value: str, tmp: TempPool) -> list[str]:
     """Return statements writing ``value`` into ``ea`` at ``size``."""
+    types = tmp.types
     if ea.mode == EAMode.DATA_REG:
-        return [write_dn(ea.reg, size, value)]
+        return [write_dn(ea.reg, size, value, types)]
 
     if ea.mode == EAMode.ADDR_REG:
         # No 68000 opcode writes a byte to An; word writes sign-extend (movea).
         if size == 'b':
             raise EAGenError('byte write to an address register')
         if size == 'l':
-            return [write_areg_long(areg(ea.reg), value)]
-        return [write_areg_word(areg(ea.reg), value)]
+            return [write_areg_long(areg(ea.reg), value, types)]
+        return [write_areg_word(areg(ea.reg), value, types)]
 
     if ea.mode == EAMode.ADDR_POSTINC:
         step = addr_step(ea.reg, size)
         return [
-            f'memory().{_WRITE_FN[size]}({areg(ea.reg)}, {value});',
+            f'memory().{_WRITE_FN[size]}({areg(ea.reg)}, '
+            f'{_cast(size, value, types)});',
             f'{areg(ea.reg)} += {step};',
         ]
 
@@ -254,11 +307,14 @@ def write_ea(ea: EA, size: str, value: str, tmp: TempPool) -> list[str]:
         step = addr_step(ea.reg, size)
         return [
             f'{areg(ea.reg)} -= {step};',
-            f'memory().{_WRITE_FN[size]}({areg(ea.reg)}, {value});',
+            f'memory().{_WRITE_FN[size]}({areg(ea.reg)}, '
+            f'{_cast(size, value, types)});',
         ]
 
     if ea.mode in (EAMode.IMMEDIATE, EAMode.PC_DISP, EAMode.PC_INDEX):
         raise EAGenError(f'{ea.mode} is not a writable destination')
 
     setup, addr = address_of(ea, tmp)
-    return setup + [f'memory().{_WRITE_FN[size]}({addr}, {value});']
+    return setup + [
+        f'memory().{_WRITE_FN[size]}({addr}, {_cast(size, value, types)});'
+    ]

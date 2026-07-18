@@ -19,6 +19,8 @@ CAST_MACROS = r'''
 #define BYTE(v) static_cast<m_byte>(v)
 #define WORD(v) static_cast<m_word>(v)
 #define LONG(v) static_cast<m_long>(v)
+#define SEX_W(v) static_cast<m_long>(static_cast<int32_t>(static_cast<int16_t>(v)))
+#define SEX_B(v) static_cast<m_long>(static_cast<int32_t>(static_cast<int8_t>(v)))
 #define BEFORE_INSTRUCTION if (irqLevel() > cpu().interruptMask()) serviceIRQ(); pace();
 // Diagnostic only: define SOR_TRACE when building to enable entry/RTS logging.
 #ifndef SOR_TRACE
@@ -31,15 +33,31 @@ _CARRY = {'b': '0x100u', 'w': '0x10000u', 'l': '0x100000000ull'}
 _CTYPE = ea._CTYPE
 _FULL = {'b': 'm_word', 'w': 'm_long', 'l': 'uint64_t'}
 _CAST = {'b': 'BYTE', 'w': 'WORD', 'l': 'LONG'}
-_WIDEN = {'b': 'WORD', 'w': 'LONG'}
 _MASK = {'b': '0xFFu', 'w': '0xFFFFu', 'l': '0xFFFFFFFFu'}
 _NBITS = {'b': 8, 'w': 16, 'l': 32}
 
 
-def _wide(size: str, expr: str) -> str:
+def _types(tmp) -> dict:
+    return getattr(tmp, 'types', {}) if tmp is not None else {}
+
+
+def _cast(size: str, expr: str, tmp=None) -> str:
+    return ea._cast(size, expr, _types(tmp))
+
+
+def _wide_sum(size: str, a: str, b: str) -> str:
+    """a ± b at enough width to capture the 68000 carry-out bit."""
     if size == 'l':
-        return f'static_cast<uint64_t>({expr})'
-    return f'{_WIDEN[size]}({expr})'
+        # m_long is 32-bit; must promote so bit 32 is visible for X/C.
+        return (f'static_cast<uint64_t>({a}) + static_cast<uint64_t>({b})')
+    # byte/word: C++ integer promotions keep the sum bits we need.
+    return f'{a} + {b}'
+
+
+def _wide_diff(size: str, a: str, b: str) -> str:
+    if size == 'l':
+        return (f'static_cast<uint64_t>({a}) - static_cast<uint64_t>({b})')
+    return f'{a} - {b}'
 
 
 def _live(live) -> frozenset:
@@ -148,7 +166,7 @@ def _src_expr(src: str, size: str, tmp, out: list[str]) -> str:
     """Use *src* inline when simple; otherwise bind once to a temp."""
     if _is_simple_expr(src):
         return src
-    name = tmp.fresh()
+    name = tmp.fresh(size)
     out.append(f'{_CTYPE[size]} {name} = {src};')
     return name
 
@@ -161,22 +179,27 @@ def add(dst: str, src: str, size: str, tmp, live=None) -> list[str]:
     src_expr = _src_expr(src, size, tmp, out)
 
     if not need:
-        out.append(
-            f'{dst} = {_CAST[size]}({_wide(size, dst)} + {_wide(size, src_expr)});')
+        # Truncating assign back into a sized temp / register field.
+        if _types(tmp).get(dst) == size:
+            out.append(f'{dst} = {dst} + {src_expr};')
+        else:
+            out.append(f'{dst} = {_cast(size, f"({dst} + {src_expr})", tmp)};')
         return out
 
     full = tmp.fresh()
-    out.append(
-        f'{_FULL[size]} {full} = {_wide(size, dst)} + {_wide(size, src_expr)};')
+    out.append(f'{_FULL[size]} {full} = {_wide_sum(size, dst, src_expr)};')
 
     need_ov = V in need
     if need_ov:
         # Keep *dst* as the pre-op value until V is computed.
-        result = tmp.fresh()
-        out.append(f'{_CTYPE[size]} {result} = {_CAST[size]}({full});')
+        result = tmp.fresh(size)
+        out.append(f'{_CTYPE[size]} {result} = {_cast(size, full, tmp)};')
         new_val = result
+    elif _types(tmp).get(dst) == size:
+        out.append(f'{dst} = {full};')
+        new_val = dst
     else:
-        out.append(f'{dst} = {_CAST[size]}({full});')
+        out.append(f'{dst} = {_cast(size, full, tmp)};')
         new_val = dst
 
     cy = ov = 'false'
@@ -189,6 +212,7 @@ def add(dst: str, src: str, size: str, tmp, live=None) -> list[str]:
             f'bool {ov} = ((~({dst} ^ {src_expr}) & ({dst} ^ {result})) '
             f'& {_SIGN[size]}) != 0;')
         out.append(f'{dst} = {result};')
+        new_val = result
 
     x_arg = cy if X in need else None
     c_arg = cy if (C in need or X in need) else 'false'
@@ -204,21 +228,25 @@ def sub(dst: str, src: str, size: str, tmp, live=None) -> list[str]:
     src_expr = _src_expr(src, size, tmp, out)
 
     if not need:
-        out.append(
-            f'{dst} = {_CAST[size]}({_wide(size, dst)} - {_wide(size, src_expr)});')
+        if _types(tmp).get(dst) == size:
+            out.append(f'{dst} = {dst} - {src_expr};')
+        else:
+            out.append(f'{dst} = {_cast(size, f"({dst} - {src_expr})", tmp)};')
         return out
 
     full = tmp.fresh()
-    out.append(
-        f'{_FULL[size]} {full} = {_wide(size, dst)} - {_wide(size, src_expr)};')
+    out.append(f'{_FULL[size]} {full} = {_wide_diff(size, dst, src_expr)};')
 
     need_ov = V in need
     if need_ov:
-        result = tmp.fresh()
-        out.append(f'{_CTYPE[size]} {result} = {_CAST[size]}({full});')
+        result = tmp.fresh(size)
+        out.append(f'{_CTYPE[size]} {result} = {_cast(size, full, tmp)};')
         new_val = result
     else:
-        out.append(f'{dst} = {_CAST[size]}({full});')
+        if _types(tmp).get(dst) == size:
+            out.append(f'{dst} = {full};')
+        else:
+            out.append(f'{dst} = {_cast(size, full, tmp)};')
         new_val = dst
 
     cy = ov = 'false'
@@ -231,6 +259,7 @@ def sub(dst: str, src: str, size: str, tmp, live=None) -> list[str]:
             f'bool {ov} = ((({dst} ^ {src_expr}) & ({dst} ^ {result})) '
             f'& {_SIGN[size]}) != 0;')
         out.append(f'{dst} = {result};')
+        new_val = result
 
     x_arg = cy if X in need else None
     c_arg = cy if (C in need or X in need) else 'false'
@@ -248,14 +277,13 @@ def cmp(dst: str, src: str, size: str, tmp, live=None) -> list[str]:
     s_expr = _src_expr(src, size, tmp, out)
 
     full = tmp.fresh()
-    out.append(
-        f'{_FULL[size]} {full} = {_wide(size, d_expr)} - {_wide(size, s_expr)};')
+    out.append(f'{_FULL[size]} {full} = {_wide_diff(size, d_expr, s_expr)};')
 
     need_result = bool(need & frozenset({N, Z, V}))
     result = '0'  # unused when only C is live
     if need_result:
-        result = tmp.fresh()
-        out.append(f'{_CTYPE[size]} {result} = {_CAST[size]}({full});')
+        result = tmp.fresh(size)
+        out.append(f'{_CTYPE[size]} {result} = {_cast(size, full, tmp)};')
 
     cy = ov = 'false'
     if C in need:
@@ -271,38 +299,40 @@ def cmp(dst: str, src: str, size: str, tmp, live=None) -> list[str]:
     return out
 
 
-def signext_to_long(value: str, size: str) -> str:
-    return ea.signext_to_long(value, size)
+def signext_to_long(value: str, size: str, tmp=None) -> str:
+    return ea.signext_to_long(value, size, _types(tmp))
 
 
-def _addr_operand(src: str, size: str) -> str:
+def _addr_operand(src: str, size: str, tmp=None) -> str:
     """Source operand of an An-destination op: word forms sign-extend to 32 bits."""
-    return signext_to_long(src, size) if size == 'w' else f'LONG({src})'
+    if size == 'w':
+        return signext_to_long(src, size, tmp)
+    return _cast('l', src, tmp)
 
 
-def movea(dst: str, src: str, size: str) -> list[str]:
-    return [f'{dst} = {_addr_operand(src, size)};']
+def movea(dst: str, src: str, size: str, tmp=None) -> list[str]:
+    return [f'{dst} = {_addr_operand(src, size, tmp)};']
 
 
-def adda(dst: str, src: str, size: str) -> list[str]:
-    return [f'{dst} = LONG({dst} + {_addr_operand(src, size)});']
+def adda(dst: str, src: str, size: str, tmp=None) -> list[str]:
+    return [f'{dst} = {dst} + {_addr_operand(src, size, tmp)};']
 
 
-def suba(dst: str, src: str, size: str) -> list[str]:
-    return [f'{dst} = LONG({dst} - {_addr_operand(src, size)});']
+def suba(dst: str, src: str, size: str, tmp=None) -> list[str]:
+    return [f'{dst} = {dst} - {_addr_operand(src, size, tmp)};']
 
 
 def cmpa(dst: str, src: str, size: str, tmp, live=None) -> list[str]:
-    return cmp(dst, _addr_operand(src, size), 'l', tmp, live=live)
+    return cmp(dst, _addr_operand(src, size, tmp), 'l', tmp, live=live)
 
 
-def logic_op(dst: str, src: str, size: str, op: str, live=None) -> list[str]:
+def logic_op(dst: str, src: str, size: str, op: str, live=None, tmp=None) -> list[str]:
     c_op = {'AND': '&', 'OR': '|', 'EOR': '^'}[op]
-    # src is already size-correct from read_ea / immediates — one cast is enough.
-    return [
-        f'{dst} = {_CAST[size]}({dst} {c_op} {src});',
-        *logical(dst, size, live=live),
-    ]
+    if _types(tmp).get(dst) == size:
+        stmt = f'{dst} = {dst} {c_op} {src};'
+    else:
+        stmt = f'{dst} = {_cast(size, f"({dst} {c_op} {src})", tmp)};'
+    return [stmt, *logical(dst, size, live=live)]
 
 
 def clr(dst: str, size: str, live=None) -> list[str]:
@@ -315,21 +345,25 @@ def neg(dst: str, size: str, tmp, live=None) -> list[str]:
     out: list[str] = []
 
     if not need:
-        out.append(
-            f'{dst} = {_CAST[size]}({_wide(size, "0")} - {_wide(size, dst)});')
+        if _types(tmp).get(dst) == size:
+            out.append(f'{dst} = -{dst};' if size == 'l' else f'{dst} = 0 - {dst};')
+        else:
+            out.append(f'{dst} = {_cast(size, f"(0 - {dst})", tmp)};')
         return out
 
     full = tmp.fresh()
-    out.append(
-        f'{_FULL[size]} {full} = {_wide(size, "0")} - {_wide(size, dst)};')
+    out.append(f'{_FULL[size]} {full} = {_wide_diff(size, "0", dst)};')
 
     need_ov = V in need
     if need_ov:
-        result = tmp.fresh()
-        out.append(f'{_CTYPE[size]} {result} = {_CAST[size]}({full});')
+        result = tmp.fresh(size)
+        out.append(f'{_CTYPE[size]} {result} = {_cast(size, full, tmp)};')
         new_val = result
     else:
-        out.append(f'{dst} = {_CAST[size]}({full});')
+        if _types(tmp).get(dst) == size:
+            out.append(f'{dst} = {full};')
+        else:
+            out.append(f'{dst} = {_cast(size, full, tmp)};')
         new_val = dst
 
     cy = ov = 'false'
@@ -341,6 +375,7 @@ def neg(dst: str, size: str, tmp, live=None) -> list[str]:
         # V: both old and new have the sign bit set (68000 NEG).
         out.append(f'bool {ov} = (({dst} & {result}) & {_SIGN[size]}) != 0;')
         out.append(f'{dst} = {result};')
+        new_val = result
 
     x_arg = cy if X in need else None
     c_arg = cy if (C in need or X in need) else 'false'
@@ -348,44 +383,55 @@ def neg(dst: str, size: str, tmp, live=None) -> list[str]:
     return out
 
 
-def not_op(dst: str, size: str, live=None) -> list[str]:
-    return [f'{dst} = {_CAST[size]}(~{dst});', *logical(dst, size, live=live)]
+def not_op(dst: str, size: str, live=None, tmp=None) -> list[str]:
+    if _types(tmp).get(dst) == size:
+        stmt = f'{dst} = ~{dst};'
+    else:
+        stmt = f'{dst} = {_cast(size, f"(~{dst})", tmp)};'
+    return [stmt, *logical(dst, size, live=live)]
 
 
 def swap(dst: str, live=None) -> list[str]:
     return [
-        f'{dst} = LONG(({dst} >> 16) | ({dst} << 16));',
+        f'{dst} = ({dst} >> 16) | ({dst} << 16);',
         *logical(dst, 'l', live=live),
     ]
 
 
 def ext(reg: int, size: str, tmp, live=None) -> list[str]:
-    v = tmp.fresh()
     if size == 'l':
+        v = tmp.fresh('l')
         return [
-            f'm_long {v} = LONG(static_cast<int32_t>(static_cast<int16_t>(cpu().dw({reg}))));',
+            f'm_long {v} = SEX_W(cpu().dw({reg}));',
             f'cpu().d[{reg}] = {v};',
             *logical(v, 'l', live=live),
         ]
+    v = tmp.fresh('w')
     return [
-        f'm_word {v} = WORD(static_cast<int16_t>(static_cast<int8_t>(cpu().db({reg}))));',
+        f'm_word {v} = static_cast<m_word>(static_cast<int16_t>('
+        f'static_cast<int8_t>(cpu().db({reg}))));',
         f'cpu().setDw({reg}, {v});',
         *logical(v, 'w', live=live),
     ]
 
 
-def bitop(dst: str, bit: str, kind: str, size: str, live=None) -> list[str]:
-    cast = _CAST[size]
+def bitop(dst: str, bit: str, kind: str, size: str, live=None, tmp=None) -> list[str]:
     live = _live(live)
     out = []
     if Z in live:
-        out.append(set_flag('z', f'((LONG({dst}) >> ({bit})) & 1u) == 0'))
+        out.append(set_flag('z', f'(({dst} >> ({bit})) & 1u) == 0'))
+    if kind == 'BTST':
+        return out
     if kind == 'BSET':
-        out.append(f'{dst} = {cast}({dst} | (1u << ({bit})));')
+        expr = f'{dst} | (1u << ({bit}))'
     elif kind == 'BCLR':
-        out.append(f'{dst} = {cast}({dst} & ~(1u << ({bit})));')
-    elif kind == 'BCHG':
-        out.append(f'{dst} = {cast}({dst} ^ (1u << ({bit})));')
+        expr = f'{dst} & ~(1u << ({bit}))'
+    else:  # BCHG
+        expr = f'{dst} ^ (1u << ({bit}))'
+    if _types(tmp).get(dst) == size:
+        out.append(f'{dst} = {expr};')
+    else:
+        out.append(f'{dst} = {_cast(size, f"({expr})", tmp)};')
     return out
 
 
@@ -400,12 +446,12 @@ def shift(dst: str, count: str, size: str, kind: str, tmp,
     live = _live(live)
     need = live & NZVCX
     v, c, ov = tmp.fresh(), tmp.fresh(), tmp.fresh()
-    cast = _CAST[size]
     mask = _MASK[size]
     sign = _SIGN[size]
     top = _NBITS[size] - 1
+    # Work in m_long; operand already sized — no extra BYTE/WORD wrap.
     out = [
-        f'm_long {v} = LONG({cast}({dst}));',
+        f'm_long {v} = {dst};',
         f'bool {c} = false;',
         f'bool {ov} = false;',
     ]
@@ -483,7 +529,10 @@ def shift(dst: str, count: str, size: str, kind: str, tmp,
                 out.append(set_flag('n', f'(({v}) & {sign}) != 0'))
             if Z in need:
                 out.append(set_flag('z', f'({v}) == 0'))
-    out.append(f'{dst} = {cast}({v});')
+    if _types(tmp).get(dst) == size:
+        out.append(f'{dst} = {v};')
+    else:
+        out.append(f'{dst} = {_cast(size, v, tmp)};')
     return out
 
 
@@ -491,14 +540,16 @@ def muldiv(dst_expr: str, src_expr: str, macro: str, tmp,
            live=None) -> tuple[list[str], str]:
     live = _live(live)
     need = live & NZVC
-    r = tmp.fresh()
+    r = tmp.fresh('l')
     if macro == 'MULU':
-        out = [f'm_long {r} = LONG(WORD({dst_expr})) * LONG(WORD({src_expr}));']
+        # dw()/imm already word-sized — multiply in long without nested casts.
+        out = [f'm_long {r} = static_cast<m_long>({dst_expr}) * '
+               f'static_cast<m_long>({src_expr});']
     elif macro == 'MULS':
         out = [
-            f'int32_t {r}_p = static_cast<int32_t>(static_cast<int16_t>(WORD({dst_expr}))) * '
-            f'static_cast<int32_t>(static_cast<int16_t>(WORD({src_expr})));',
-            f'm_long {r} = LONG({r}_p);',
+            f'int32_t {r}_p = static_cast<int32_t>(static_cast<int16_t>({dst_expr})) * '
+            f'static_cast<int32_t>(static_cast<int16_t>({src_expr}));',
+            f'm_long {r} = static_cast<m_long>({r}_p);',
         ]
     elif macro == 'DIVU':
         s, q, rem = tmp.fresh(), tmp.fresh(), tmp.fresh()
@@ -644,12 +695,16 @@ def nbcd(dst: str, tmp, live=None) -> list[str]:
 
 def negx(dst: str, size: str, tmp, live=None) -> list[str]:
     live = _live(live)
-    x, full, outv, borrow, old = (tmp.fresh() for _ in range(5))
+    x = tmp.fresh()
+    full = tmp.fresh()
+    outv = tmp.fresh(size)
+    borrow = tmp.fresh()
+    old = tmp.fresh(size)
     out = [
         f'int {x} = {flag("x")} ? 1 : 0;',
         f'{_CTYPE[size]} {old} = {dst};',
-        f'{_FULL[size]} {full} = {_wide(size, "0")} - {_wide(size, old)} - {x};',
-        f'{_CTYPE[size]} {outv} = {_CAST[size]}({full});',
+        f'{_FULL[size]} {full} = {_wide_diff(size, "0", old)} - {x};',
+        f'{_CTYPE[size]} {outv} = {_cast(size, full, tmp)};',
         f'bool {borrow} = ({full} & {_CARRY[size]}) != 0;',
     ]
     if Z in live:

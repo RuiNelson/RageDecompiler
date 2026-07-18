@@ -465,16 +465,16 @@ class Generator:
             return ar
         return ea.read_dn(n, size)
 
-    def _movem_reg_write(self, is_addr, n, size, value):
+    def _movem_reg_write(self, is_addr, n, size, value, types=None):
         if is_addr:
             ar = ea.areg(n)
             if size == 'l':
-                return ea.write_areg_long(ar, value)
-            return ea.write_areg_word(ar, value)
+                return ea.write_areg_long(ar, value, types)
+            return ea.write_areg_word(ar, value, types)
         if size == 'l':
-            return ea.write_dn(n, 'l', value)
+            return ea.write_dn(n, 'l', value, types)
         # MOVEM memory→register sign-extends each word to 32 bits — Dn too.
-        return ea.write_dn(n, 'l', ea.signext_to_long(value, 'w'))
+        return ea.write_dn(n, 'l', ea.signext_to_long(value, 'w', types), types)
 
     def _emit_movem(self, instr):
         size = instr.size or 'w'
@@ -484,6 +484,7 @@ class Generator:
                   'l': 'memory().writeLong'}[size]
         nbytes = 4 if size == 'l' else 2
         tmp = TempPool(instr.address)
+        reg_size = 'l' if size == 'l' else 'w'
 
         # The memory side is the operand with a memory addressing mode; the
         # other operand is the register list (possibly a single register, which
@@ -504,7 +505,7 @@ class Generator:
             if (True, mem.reg) in regs:
                 # 68000: when the base An is in the list, its *initial* value
                 # is stored, not the partially-decremented one.
-                init = tmp.fresh()
+                init = tmp.fresh('l')
                 out.append(f'm_long {init} = {ar};')
             for is_addr, n in reversed(regs):       # predec stores high→low
                 out.append(f'{ar} -= {nbytes};')
@@ -517,26 +518,26 @@ class Generator:
         if not store and mem.mode == EAMode.ADDR_POSTINC:
             ar = ea.areg(mem.reg)
             for is_addr, n in regs:
-                v = tmp.fresh()
+                v = tmp.fresh(reg_size)
                 out.append(f'm_{"long" if size == "l" else "word"} {v} '
                            f'= {loads}({ar});')
                 out.append(f'{ar} += {nbytes};')
-                out.append(self._movem_reg_write(is_addr, n, size, v))
+                out.append(self._movem_reg_write(is_addr, n, size, v, tmp.types))
             return out
 
         # Control addressing modes: sequential offsets from a fixed base.
         setup, addr = ea.address_of(mem, tmp)
-        base = tmp.fresh()
+        base = tmp.fresh('l')
         out += setup + [f'm_long {base} = {addr};']
         for off, (is_addr, n) in enumerate(regs):
             ea_expr = f'{base} + {off * nbytes}'
             if store:
                 out.append(f'{storem}({ea_expr}, {self._movem_reg_read(is_addr, n, size)});')
             else:
-                v = tmp.fresh()
+                v = tmp.fresh(reg_size)
                 out.append(f'm_{"long" if size == "l" else "word"} {v} '
                            f'= {loads}({ea_expr});')
-                out.append(self._movem_reg_write(is_addr, n, size, v))
+                out.append(self._movem_reg_write(is_addr, n, size, v, tmp.types))
         return out
 
     # -- function emission ----------------------------------------------------
