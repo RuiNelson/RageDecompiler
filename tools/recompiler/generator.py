@@ -348,8 +348,8 @@ class Generator:
             body = self._transfer(a, instr.targets[0])
             ctr = f'dbcc_{a:06x}'
             return [f'if (!({sem.cc_expr(cc)})) {{',
-                    f'    m_word {ctr} = WORD((WORD(cpu().d[{reg}] & 0xFFFFu) - 1) & 0xFFFFu);',
-                    f'    cpu().d[{reg}] = LONG((cpu().d[{reg}] & 0xFFFF0000u) | LONG({ctr}));',
+                    f'    m_word {ctr} = WORD((cpu().dw({reg}) - 1) & 0xFFFFu);',
+                    f'    cpu().setDw({reg}, {ctr});',
                     f'    if ({ctr} != 0xFFFFu) {{'] + \
                    [f'        {s}' for s in body] + ['    }', '}']
 

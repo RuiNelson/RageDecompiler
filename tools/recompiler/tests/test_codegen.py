@@ -62,8 +62,8 @@ def test_areg_a7_is_ssp():
 
 def test_read_data_reg_sizes():
     assert ea.read_ea(EA(EAMode.DATA_REG, reg=3), 'l', _tp())[1] == 'cpu().d[3]'
-    assert ea.read_ea(EA(EAMode.DATA_REG, reg=0), 'b', _tp())[1] == \
-        'BYTE(cpu().d[0] & 0xFFu)'
+    assert ea.read_ea(EA(EAMode.DATA_REG, reg=0), 'b', _tp())[1] == 'cpu().db(0)'
+    assert ea.read_ea(EA(EAMode.DATA_REG, reg=1), 'w', _tp())[1] == 'cpu().dw(1)'
 
 
 def test_read_postinc_has_side_effect_after_read():
@@ -98,9 +98,9 @@ def test_read_predec_decrements_before_read():
 
 def test_write_subregister_uses_merge_helpers():
     assert ea.write_ea(EA(EAMode.DATA_REG, reg=2), 'b', 'v', _tp()) == \
-        ['cpu().d[2] = LONG((cpu().d[2] & 0xFFFFFF00u) | LONG(BYTE(v)));']
+        ['cpu().setDb(2, BYTE(v));']
     assert ea.write_ea(EA(EAMode.DATA_REG, reg=2), 'w', 'v', _tp()) == \
-        ['cpu().d[2] = LONG((cpu().d[2] & 0xFFFF0000u) | LONG(WORD(v)));']
+        ['cpu().setDw(2, WORD(v));']
 
 
 def test_write_addr_reg_word_sign_extends():
@@ -142,7 +142,8 @@ def test_move_word_to_data_reg_preserves_high_word():
     """68000 MOVE.W to Dn merges the low word and preserves the high word."""
     out = '\n'.join(opcodes.emit_dataop(_instr(
         'move', 'w', [EA(EAMode.DATA_REG, reg=0), EA(EAMode.DATA_REG, reg=7)])))
-    assert 'cpu().d[7]' in out and '0xFFFF0000u' in out
+    assert 'cpu().setDw(7,' in out
+    assert 'cpu().dw(0)' in out
     assert 'cpu().setNZClearVC' in out
 
 
@@ -195,7 +196,7 @@ def test_add_uses_macro_and_writes_back():
     out = '\n'.join(opcodes.emit_dataop(_instr(
         'add', 'w', [EA(EAMode.DATA_REG, reg=0), EA(EAMode.DATA_REG, reg=1)])))
     assert '+ LONG(' in out
-    assert 'cpu().d[1]' in out
+    assert 'cpu().setDw(1,' in out
     assert 'cpu().setNZVCX' in out
 
 
@@ -262,7 +263,7 @@ def test_scc_sets_byte_by_condition():
         'sne', 'b', [EA(EAMode.DATA_REG, reg=6)])))
     assert 'BYTE(0xFF)' in out and 'BYTE(0)' in out
     assert 'cpu().condition(6)' in out
-    assert 'cpu().d[6]' in out
+    assert 'cpu().setDb(6,' in out
 
 
 def test_exg_swaps_registers():

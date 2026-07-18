@@ -278,13 +278,13 @@ def ext(reg: int, size: str, tmp, live=None) -> list[str]:
     v = tmp.fresh()
     if size == 'l':
         return [
-            f'm_long {v} = LONG(static_cast<int32_t>(static_cast<int16_t>(cpu().d[{reg}] & 0xFFFFu)));',
+            f'm_long {v} = LONG(static_cast<int32_t>(static_cast<int16_t>(cpu().dw({reg}))));',
             f'cpu().d[{reg}] = {v};',
             *logical(v, 'l', live=live),
         ]
     return [
-        f'm_word {v} = WORD(static_cast<int16_t>(static_cast<int8_t>(cpu().d[{reg}] & 0xFFu)));',
-        f'cpu().d[{reg}] = LONG((cpu().d[{reg}] & 0xFFFF0000u) | LONG({v}));',
+        f'm_word {v} = WORD(static_cast<int16_t>(static_cast<int8_t>(cpu().db({reg}))));',
+        f'cpu().setDw({reg}, {v});',
         *logical(v, 'w', live=live),
     ]
 

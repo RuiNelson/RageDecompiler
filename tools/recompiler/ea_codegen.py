@@ -8,8 +8,8 @@ are sequenced correctly even when the same register appears in both operands
 
 Conventions of the emitted code
 -------------------------------
-* Data registers are reached through ``cpu().d[n]`` with explicit sub-field
-  masking on read and merge-on-write for byte/word.
+* Data registers use ``cpu().d[n]`` for long and ``cpu().db/dw/setDb/setDw``
+  for byte/word (merge-on-write helpers on ``CPU68K``).
 * Address registers use ``cpu().a[n]`` / ``cpu().ssp`` (A7); word writes sign-
   extend to 32 bits (movea / lea rule).
 * Memory is reached through ``memory()`` (``SystemMemory``):
@@ -79,20 +79,18 @@ def addr_step(reg: int, size: str) -> int:
 def read_dn(n: int, size: str) -> str:
     """Expression reading Dn at byte / word / long width."""
     if size == 'b':
-        return f'BYTE(cpu().d[{n}] & 0xFFu)'
+        return f'cpu().db({n})'
     if size == 'w':
-        return f'WORD(cpu().d[{n}] & 0xFFFFu)'
+        return f'cpu().dw({n})'
     return f'cpu().d[{n}]'
 
 
 def write_dn(n: int, size: str, value: str) -> str:
     """Statement writing ``value`` into Dn, preserving untouched high bits."""
     if size == 'b':
-        return (f'cpu().d[{n}] = LONG((cpu().d[{n}] & 0xFFFFFF00u) '
-                f'| LONG({_cast("b", value)}));')
+        return f'cpu().setDb({n}, {_cast("b", value)});'
     if size == 'w':
-        return (f'cpu().d[{n}] = LONG((cpu().d[{n}] & 0xFFFF0000u) '
-                f'| LONG({_cast("w", value)}));')
+        return f'cpu().setDw({n}, {_cast("w", value)});'
     return f'cpu().d[{n}] = {_cast("l", value)};'
 
 
