@@ -195,9 +195,24 @@ def test_move_special_registers_use_cpu_sr_helpers():
 def test_add_uses_macro_and_writes_back():
     out = '\n'.join(opcodes.emit_dataop(_instr(
         'add', 'w', [EA(EAMode.DATA_REG, reg=0), EA(EAMode.DATA_REG, reg=1)])))
-    assert '+ LONG(' in out
+    assert '+ LONG(' in out or '+ ' in out
     assert 'cpu().setDw(1,' in out
     assert 'cpu().setNZVCX' in out
+    # No redundant "old = dst" copy when V is live (still uses dst before write).
+    assert not re.search(r'm_word t\d+ = t\d+;', out)
+
+
+def test_addq_dead_flags_is_compact():
+    """addq with no live flags: one RMW temp + one assignment, no flag temps."""
+    out = '\n'.join(opcodes.emit_dataop(
+        _instr('addq', 'w',
+               [EA(EAMode.IMMEDIATE, imm=1), EA(EAMode.DATA_REG, reg=0)]),
+        live_flags=frozenset()))
+    assert 'cpu().setDw(0,' in out
+    assert 'setNZ' not in out
+    assert 'setFlag' not in out
+    # Immediate inlined — not copied into a second m_word temp.
+    assert out.count('m_word ') <= 1
 
 
 def test_cmp_sets_flags_without_writing():

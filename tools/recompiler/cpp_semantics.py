@@ -10,6 +10,8 @@ stays faithful but readable; ``live is None`` means “all flags live” (safe
 default for unit tests and unknown contexts).
 """
 
+import re
+
 from tools.recompiler import ea_codegen as ea
 from tools.recompiler.ccr_liveness import ALL, C, N, V, X, Z, NZVC, NZVCX
 
@@ -124,60 +126,115 @@ def move(value: str, size: str, live=None) -> list[str]:
     return logical(value, size, live=live)
 
 
+def _is_simple_expr(expr: str) -> bool:
+    """True if *expr* is safe to embed/reuse without a temporary copy.
+
+    Covers temps, bare registers, single-level casts, and numeric literals —
+    not memory reads or multi-operator expressions (those stay materialized).
+    """
+    e = expr.strip()
+    if re.fullmatch(r't\d+', e):
+        return True
+    if re.fullmatch(r'cpu\(\)\.(?:d\[\d\]|db\(\d\)|dw\(\d\)|a\[\d\]|ssp)', e):
+        return True
+    if re.fullmatch(r'(?:BYTE|WORD|LONG)\([^()]+\)', e):
+        return True
+    if re.fullmatch(r'0x[0-9A-Fa-f]+u?', e) or re.fullmatch(r'\d+u?', e):
+        return True
+    return False
+
+
+def _src_expr(src: str, size: str, tmp, out: list[str]) -> str:
+    """Use *src* inline when simple; otherwise bind once to a temp."""
+    if _is_simple_expr(src):
+        return src
+    name = tmp.fresh()
+    out.append(f'{_CTYPE[size]} {name} = {src};')
+    return name
+
+
 def add(dst: str, src: str, size: str, tmp, live=None) -> list[str]:
+    """dst += src with optional CCR updates; no redundant t_old = dst copies."""
     live = _live(live)
     need = live & NZVCX
-    old, sval, full = (tmp.fresh() for _ in range(3))
-    out = [
-        f'{_CTYPE[size]} {old} = {dst};',
-        f'{_CTYPE[size]} {sval} = {src};',
-        f'{_FULL[size]} {full} = {_wide(size, old)} + {_wide(size, sval)};',
-        f'{dst} = {_CAST[size]}({full});',
-    ]
+    out: list[str] = []
+    src_expr = _src_expr(src, size, tmp, out)
+
     if not need:
+        out.append(
+            f'{dst} = {_CAST[size]}({_wide(size, dst)} + {_wide(size, src_expr)});')
         return out
-    need_cy = bool(need & frozenset({C, X}))
+
+    full = tmp.fresh()
+    out.append(
+        f'{_FULL[size]} {full} = {_wide(size, dst)} + {_wide(size, src_expr)};')
+
     need_ov = V in need
+    if need_ov:
+        # Keep *dst* as the pre-op value until V is computed.
+        result = tmp.fresh()
+        out.append(f'{_CTYPE[size]} {result} = {_CAST[size]}({full});')
+        new_val = result
+    else:
+        out.append(f'{dst} = {_CAST[size]}({full});')
+        new_val = dst
+
     cy = ov = 'false'
-    if need_cy:
+    if need & frozenset({C, X}):
         cy = tmp.fresh()
         out.append(f'bool {cy} = ({full} & {_CARRY[size]}) != 0;')
     if need_ov:
         ov = tmp.fresh()
         out.append(
-            f'bool {ov} = ((~({old} ^ {sval}) & ({old} ^ {dst})) & {_SIGN[size]}) != 0;')
-    # Only pass x= when X is live; otherwise CMP-style NZVC update leaves X alone.
+            f'bool {ov} = ((~({dst} ^ {src_expr}) & ({dst} ^ {result})) '
+            f'& {_SIGN[size]}) != 0;')
+        out.append(f'{dst} = {result};')
+
     x_arg = cy if X in need else None
     c_arg = cy if (C in need or X in need) else 'false'
-    out += set_nzvc(dst, size, ov, c_arg, x=x_arg, live=need)
+    out += set_nzvc(new_val, size, ov, c_arg, x=x_arg, live=need)
     return out
 
 
 def sub(dst: str, src: str, size: str, tmp, live=None) -> list[str]:
+    """dst -= src with optional CCR updates; no redundant t_old = dst copies."""
     live = _live(live)
     need = live & NZVCX
-    old, sval, full = (tmp.fresh() for _ in range(3))
-    out = [
-        f'{_CTYPE[size]} {old} = {dst};',
-        f'{_CTYPE[size]} {sval} = {src};',
-        f'{_FULL[size]} {full} = {_wide(size, old)} - {_wide(size, sval)};',
-        f'{dst} = {_CAST[size]}({full});',
-    ]
+    out: list[str] = []
+    src_expr = _src_expr(src, size, tmp, out)
+
     if not need:
+        out.append(
+            f'{dst} = {_CAST[size]}({_wide(size, dst)} - {_wide(size, src_expr)});')
         return out
-    need_cy = bool(need & frozenset({C, X}))
+
+    full = tmp.fresh()
+    out.append(
+        f'{_FULL[size]} {full} = {_wide(size, dst)} - {_wide(size, src_expr)};')
+
     need_ov = V in need
+    if need_ov:
+        result = tmp.fresh()
+        out.append(f'{_CTYPE[size]} {result} = {_CAST[size]}({full});')
+        new_val = result
+    else:
+        out.append(f'{dst} = {_CAST[size]}({full});')
+        new_val = dst
+
     cy = ov = 'false'
-    if need_cy:
+    if need & frozenset({C, X}):
         cy = tmp.fresh()
         out.append(f'bool {cy} = ({full} & {_CARRY[size]}) != 0;')
     if need_ov:
         ov = tmp.fresh()
         out.append(
-            f'bool {ov} = ((({old} ^ {sval}) & ({old} ^ {dst})) & {_SIGN[size]}) != 0;')
+            f'bool {ov} = ((({dst} ^ {src_expr}) & ({dst} ^ {result})) '
+            f'& {_SIGN[size]}) != 0;')
+        out.append(f'{dst} = {result};')
+
     x_arg = cy if X in need else None
     c_arg = cy if (C in need or X in need) else 'false'
-    out += set_nzvc(dst, size, ov, c_arg, x=x_arg, live=need)
+    out += set_nzvc(new_val, size, ov, c_arg, x=x_arg, live=need)
     return out
 
 
@@ -186,13 +243,20 @@ def cmp(dst: str, src: str, size: str, tmp, live=None) -> list[str]:
     need = live & NZVC
     if not need:
         return []
-    dval, sval, full, result = (tmp.fresh() for _ in range(4))
-    out = [
-        f'{_CTYPE[size]} {dval} = {dst};',
-        f'{_CTYPE[size]} {sval} = {src};',
-        f'{_FULL[size]} {full} = {_wide(size, dval)} - {_wide(size, sval)};',
-        f'{_CTYPE[size]} {result} = {_CAST[size]}({full});',
-    ]
+    out: list[str] = []
+    d_expr = _src_expr(dst, size, tmp, out)
+    s_expr = _src_expr(src, size, tmp, out)
+
+    full = tmp.fresh()
+    out.append(
+        f'{_FULL[size]} {full} = {_wide(size, d_expr)} - {_wide(size, s_expr)};')
+
+    need_result = bool(need & frozenset({N, Z, V}))
+    result = '0'  # unused when only C is live
+    if need_result:
+        result = tmp.fresh()
+        out.append(f'{_CTYPE[size]} {result} = {_CAST[size]}({full});')
+
     cy = ov = 'false'
     if C in need:
         cy = tmp.fresh()
@@ -200,7 +264,9 @@ def cmp(dst: str, src: str, size: str, tmp, live=None) -> list[str]:
     if V in need:
         ov = tmp.fresh()
         out.append(
-            f'bool {ov} = ((({dval} ^ {sval}) & ({dval} ^ {result})) & {_SIGN[size]}) != 0;')
+            f'bool {ov} = ((({d_expr} ^ {s_expr}) & ({d_expr} ^ {result})) '
+            f'& {_SIGN[size]}) != 0;')
+
     out += set_nzvc(result, size, ov, cy, live=need)
     return out
 
@@ -246,24 +312,39 @@ def clr(dst: str, size: str, live=None) -> list[str]:
 def neg(dst: str, size: str, tmp, live=None) -> list[str]:
     live = _live(live)
     need = live & NZVCX
-    old, full = tmp.fresh(), tmp.fresh()
-    out = [
-        f'{_CTYPE[size]} {old} = {dst};',
-        f'{_FULL[size]} {full} = {_wide(size, "0")} - {_wide(size, old)};',
-        f'{dst} = {_CAST[size]}({full});',
-    ]
+    out: list[str] = []
+
     if not need:
+        out.append(
+            f'{dst} = {_CAST[size]}({_wide(size, "0")} - {_wide(size, dst)});')
         return out
+
+    full = tmp.fresh()
+    out.append(
+        f'{_FULL[size]} {full} = {_wide(size, "0")} - {_wide(size, dst)};')
+
+    need_ov = V in need
+    if need_ov:
+        result = tmp.fresh()
+        out.append(f'{_CTYPE[size]} {result} = {_CAST[size]}({full});')
+        new_val = result
+    else:
+        out.append(f'{dst} = {_CAST[size]}({full});')
+        new_val = dst
+
     cy = ov = 'false'
     if need & frozenset({C, X}):
         cy = tmp.fresh()
         out.append(f'bool {cy} = ({full} & {_CARRY[size]}) != 0;')
-    if V in need:
+    if need_ov:
         ov = tmp.fresh()
-        out.append(f'bool {ov} = (({old} & {dst}) & {_SIGN[size]}) != 0;')
+        # V: both old and new have the sign bit set (68000 NEG).
+        out.append(f'bool {ov} = (({dst} & {result}) & {_SIGN[size]}) != 0;')
+        out.append(f'{dst} = {result};')
+
     x_arg = cy if X in need else None
     c_arg = cy if (C in need or X in need) else 'false'
-    out += set_nzvc(dst, size, ov, c_arg, x=x_arg, live=need)
+    out += set_nzvc(new_val, size, ov, c_arg, x=x_arg, live=need)
     return out
 
 
