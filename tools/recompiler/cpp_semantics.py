@@ -48,19 +48,19 @@ CAST_MACROS = r'''
 #define RETURN_68K() do { \
     cpu().ssp += 4; \
     if ((cpu().ssp & 0x00FFFFFFu) > 0x00FFFF00u) { \
-        std::fprintf(stderr, "[RTS] ssp=$%06X fn=$%06X\n", \
-                     static_cast<unsigned>(cpu().ssp & 0x00FFFFFFu), \
-                     static_cast<unsigned>(lastFunction() & 0x00FFFFFFu)); \
+        Logger::log("[RTS] ssp=$%06X fn=$%06X", \
+                    static_cast<unsigned>(cpu().ssp & 0x00FFFFFFu), \
+                    static_cast<unsigned>(lastFunction() & 0x00FFFFFFu)); \
     } \
     return; \
 } while (0)
 #else
 #define RETURN_68K() do { cpu().ssp += 4; return; } while (0)
 #endif
-// Diagnostic only: define SOR_TRACE when building to enable entry/RTS logging.
-#ifndef SOR_TRACE
-#define traceEnter(addr) ((void)0)
-#endif
+// Logs only when `addr` is a subroutine entry named in labels.csv
+// (see labelledEntryLog in generated Sor.cpp). Unnamed sub_XXXXXX entries are silent.
+void labelledEntryLog(m_long addr);
+#define traceEnter(addr) labelledEntryLog(addr)
 '''
 
 _SIGN = {'b': '0x80u', 'w': '0x8000u', 'l': '0x80000000u'}

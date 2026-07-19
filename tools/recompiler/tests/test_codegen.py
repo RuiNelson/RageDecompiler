@@ -333,7 +333,8 @@ def test_irq_check_emitted_before_each_instruction():
     assert '#define F_Z' not in src
     assert 'cpu().enterInterrupt(level);' in src
     assert '#include "M68KMacros.hpp"' not in src
-    assert '#define traceEnter(addr) ((void)0)' in src
+    assert '#define traceEnter(addr) labelledEntryLog(addr)' in src
+    assert 'void labelledEntryLog(m_long addr)' in src
     assert '#define CALL(' in src
     assert '#define RETURN_68K()' in src
 

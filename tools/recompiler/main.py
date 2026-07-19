@@ -510,11 +510,13 @@ def main(argv=None):
     # (labels.csv) take precedence over the general address labels
     # (addresses.csv). Names at non-code addresses are harmlessly ignored.
     names = {}
+    log_labels = {}
     if os.path.exists(args.addresses_csv):
         names.update({a: x.label for a, x in
                       _load_csv_addresses(args.addresses_csv).items()})
     if os.path.exists(args.labels_csv):
-        names.update(_load_labels_csv(args.labels_csv)[0])
+        log_labels = _load_labels_csv(args.labels_csv)[0]
+        names.update(log_labels)
 
     manual_functions = set(_load_aux(args.manual_functions))
     unknown_manual = manual_functions - set(disasm.subroutines)
@@ -529,7 +531,8 @@ def main(argv=None):
                     baseline_instrs=baseline_instrs,
                     manual_functions=manual_functions,
                     confirm_addrs=confirm_entries,
-                    rom=rom)
+                    rom=rom,
+                    log_labels=log_labels)
     source = gen.emit_source()   # must run first — populates self._rejected
     header = gen.emit_header()
 
