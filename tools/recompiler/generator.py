@@ -602,11 +602,12 @@ class Generator:
             ea.set_active_rom(None)
 
     def _emit_labelled_entry_log(self):
-        """Switch for labels.csv-named subroutine entries → async Logger.
+        """Switch for incomplete labels.csv subroutine entries → async Logger.
 
-        Only addresses present in labels.csv that became real function entries
-        (not anonymous sub_XXXXXX fallbacks) are logged. addresses.csv names
-        alone do not produce entry logs.
+        Only addresses present in labels.csv whose description does **not**
+        contain ``100%`` (still under investigation), and that became real
+        function entries (not anonymous sub_XXXXXX fallbacks), are logged.
+        Fully known (100%) routines and addresses.csv-only names stay silent.
         """
         named = []
         for e in sorted(self.part.entries):

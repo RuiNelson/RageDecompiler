@@ -515,8 +515,15 @@ def main(argv=None):
         names.update({a: x.label for a, x in
                       _load_csv_addresses(args.addresses_csv).items()})
     if os.path.exists(args.labels_csv):
-        log_labels = _load_labels_csv(args.labels_csv)[0]
-        names.update(log_labels)
+        label_names, label_comments = _load_labels_csv(args.labels_csv)
+        names.update(label_names)
+        # Entry logs only for labels still under investigation (description
+        # does not claim 100% confidence). Fully known routines stay quiet.
+        log_labels = {
+            addr: name
+            for addr, name in label_names.items()
+            if '100%' not in label_comments.get(addr, '')
+        }
 
     manual_functions = set(_load_aux(args.manual_functions))
     unknown_manual = manual_functions - set(disasm.subroutines)
