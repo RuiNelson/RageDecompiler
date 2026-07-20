@@ -558,6 +558,43 @@ def test_partition_assigns_to_nearest_entry():
     assert part.functions[0x100].addrs == [0x100, 0x102]
 
 
+def test_branch_between_callable_entries_stays_a_goto():
+    ins = {
+        0x100: _instr('bra', None, [], FlowType.BRANCH),
+        0x200: _instr('nop', None, []),
+        0x202: _instr('rts', None, [], FlowType.RETURN),
+    }
+    ins[0x100].targets = [0x200]
+    for address, instruction in ins.items():
+        instruction.address = address
+
+    src = Generator(ins, {0x100, 0x200}).emit_source()
+
+    body = _function_source(src, 'sub_000100')
+    assert 'goto L000200;' in body
+    assert 'case 0x0200u: goto L000200;' in body
+    assert 'case 0x0200u: sub_000100(0x0200u); return;' in src
+    assert 'void Sor::sub_000200(m_long entry_) {\n    sub_000100(entry_);' in src
+
+
+def test_indirect_jump_to_grouped_entry_stays_local():
+    ins = {
+        0x100: _instr('jmp', None, [EA(EAMode.ADDR_IND, reg=0)],
+                      FlowType.BRANCH),
+        0x200: _instr('bra', None, [], FlowType.BRANCH),
+    }
+    ins[0x100].indirect = True
+    ins[0x200].targets = [0x100]
+    for address, instruction in ins.items():
+        instruction.address = address
+
+    body = _function_source(Generator(ins, {0x100, 0x200}).emit_source(),
+                            'sub_000100')
+
+    assert 'case 0x0200u: goto L000200;' in body
+    assert 'dispatch(jump_target_000100); return;' in body
+
+
 def test_load_aux_ignores_vector_table_and_odd_addresses(tmp_path):
     aux = tmp_path / 'aux.txt'
     aux.write_text('0000001e\n00000200\n00000201\n00000436 ; valid\n')
@@ -600,7 +637,7 @@ def test_recompiler_speculative_option_emits_speculative_hooks(tmp_path):
     # Mid-instruction entries are real lightweight functions which forward to
     # their grouped owner with the precise 68000 address.
     assert 'void Sor::sub_0003be() {' in source
-    assert 'sub_0003ba(0x03BEu);' in source
+    assert re.search(r'void Sor::sub_0003be\(\) \{\n    \w+\(0x03BEu\);', source)
     assert ('case 0x00012B94u: confirmSpeculative(0x00012B94u); '
             'sub_012b94(); return;') in source
     assert 'void Sor::sub_012b94() {' in source

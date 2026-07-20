@@ -114,6 +114,47 @@ def _speculative_owner_overrides(instructions, speculative_addrs,
     return owners
 
 
+def _tail_owner_overrides(instructions, subroutines, owner_overrides,
+                          excluded_entries):
+    """Keep 68000 tail branches inside one native function.
+
+    A label may also be a callable entry, but a ``bra`` to it is still a jump,
+    not a C++ call. Group entries joined by branches so back-edges remain gotos.
+    """
+    initial = partition(instructions, subroutines, owner_overrides)
+    parent = {entry: entry for entry in initial.entries}
+
+    def find(entry):
+        while parent[entry] != entry:
+            parent[entry] = parent[parent[entry]]
+            entry = parent[entry]
+        return entry
+
+    def union(left, right):
+        left, right = find(left), find(right)
+        if left != right:
+            parent[max(left, right)] = min(left, right)
+
+    excluded_entries = set(excluded_entries or ())
+    for addr, instr in instructions.items():
+        if instr.flow not in (FlowType.BRANCH, FlowType.CONDITIONAL):
+            continue
+        source = initial.func_of(addr)
+        for target in instr.targets:
+            if target not in instructions:
+                continue
+            destination = initial.func_of(target)
+            if source != destination and not ({source, destination} & excluded_entries):
+                union(source, destination)
+
+    aliases = {entry for entry in initial.entries if find(entry) != entry}
+    overrides = dict(owner_overrides)
+    for entry in aliases:
+        owner = find(entry)
+        overrides.update({addr: owner for addr in initial.functions[entry].addrs})
+    return set(initial.entries) - aliases, aliases, overrides
+
+
 class Stats:
     def __init__(self):
         self.handled = 0
@@ -150,13 +191,17 @@ class Generator:
         # — these get their full address list instead of the baseline-filtered one.
         self._speculative_scope = set(
             phase2_addrs if speculative_scope is None else speculative_scope)
+        self._manual_functions = set(manual_functions or [])
         speculative_owners = _speculative_owner_overrides(
             instructions, phase2_addrs, self._speculative_scope)
-        self.part = partition(instructions, subroutines,
-                              owner_overrides=speculative_owners)
+        body_entries, self._entry_aliases, owners = _tail_owner_overrides(
+            instructions, subroutines, speculative_owners,
+            self._manual_functions | self._speculative_scope)
+        self._all_entries = set(subroutines)
+        self.part = partition(instructions, body_entries,
+                              owner_overrides=owners)
         # Functions implemented by hand retain generated declarations, calls,
         # and dispatch entries, but their C++ bodies are omitted.
-        self._manual_functions = set(manual_functions or [])
         # Effective instruction addresses per function.
         # Baseline functions are restricted to Phase-1 addresses so that phantom
         # instructions injected by overlapping speculative decodes are excluded.
@@ -181,7 +226,7 @@ class Generator:
         # Mid-function speculative addresses use the existing entry_ switch and
         # local-label mechanism.  A small wrapper per address calls the owning
         # grouped body, preserving intra-routine gotos and 68000 loops.
-        for addr in self._speculative:
+        for addr in self._speculative | self._entry_aliases:
             owner = self.part.func_of(addr)
             if addr != owner:
                 self.part.functions[owner].extra_entries.add(addr)
@@ -198,7 +243,7 @@ class Generator:
         when it sanitizes to a free identifier, otherwise ``sub_XXXXXX``."""
         self._fnname = {}
         used = set()
-        for e in self.part.entries:
+        for e in sorted(self._all_entries):
             ident = _sanitize(names.get(e, '')) if names.get(e) else None
             if not ident or ident in _RESERVED or ident in used:
                 ident = _fn(e)
@@ -299,6 +344,17 @@ class Generator:
         if m in ('jmp',):
             if instr.indirect or not instr.targets:
                 setup, addr = self._jump_address(instr)
+                owner = self.part.func_of(a)
+                local_targets = sorted(
+                    target for target in self.part.functions[owner].extra_entries
+                    if target in self._addrs_sets[owner])
+                if local_targets:
+                    target = f'jump_target_{a:06x}'
+                    setup += [f'm_long {target} = {addr};', f'switch ({target}) {{']
+                    setup += [f'    case {ea._hex(entry)}: goto {self.label(entry)};'
+                              for entry in local_targets]
+                    setup += ['    default: break;', '}']
+                    addr = target
                 return setup + [f'traceEnter({ea._hex(a)});',
                                 f'dispatch({addr}); return;']
             return self._transfer(a, instr.targets[0])
@@ -528,7 +584,7 @@ class Generator:
 
     def _emit_function(self, func):
         out = [f'void Sor::{self.fn(func.entry)}(m_long entry_) {{']
-        out.append(f'    traceEnter({ea._hex(func.entry)});')
+        out.append('    traceEnter(entry_);')
         return self._emit_function_body(func, out)
 
     def _emit_function_body(self, func, out):
@@ -582,12 +638,24 @@ class Generator:
             '}',
         ])
 
+    def _emit_entry_alias_wrapper(self, addr):
+        """Preserve names used by hand-written code for grouped entries."""
+        owner = self.part.func_of(addr)
+        return '\n'.join([
+            f'void Sor::{self.fn(addr)}(m_long entry_) {{',
+            f'    {self.fn(owner)}(entry_);',
+            '}',
+        ])
+
 
     # -- whole-program emission ----------------------------------------------
 
     def emit_header(self):
         decls = [f'    void {self.fn(e)}(m_long entry_ = {ea._hex(e)});'
                  for e in self.part.entries if e not in self._rejected]
+        decls += [f'    void {self.fn(e)}(m_long entry_ = {ea._hex(e)});'
+                  for e in sorted(self._entry_aliases)
+                  if self.part.func_of(e) not in self._rejected]
         decls += [f'    void {self.speculative_fn(addr)}();'
                   for addr in sorted(self._speculative)
                   if addr not in self.part.functions
@@ -610,7 +678,7 @@ class Generator:
         Fully known (100%) routines and addresses.csv-only names stay silent.
         """
         named = []
-        for e in sorted(self.part.entries):
+        for e in sorted(self._all_entries):
             if e not in self._log_labels:
                 continue
             name = self._fnname.get(e, _fn(e))
@@ -675,7 +743,7 @@ class Generator:
                   if e not in rejected and e not in self._manual_functions}
 
         disp = ['void Sor::dispatch(m_long addr) {', '    switch (addr) {']
-        dispatch_entries = sorted(set(self.part.entries) | self._speculative)
+        dispatch_entries = sorted(self._all_entries | self._speculative)
         for e in dispatch_entries:
             owner = self.part.func_of(e)
             if owner not in rejected:
@@ -685,13 +753,19 @@ class Generator:
                         f'confirmSpeculative({ea._hex(e)}); '
                         f'{self.speculative_fn(e)}(); return;')
                 else:
-                    disp.append(f'        case {ea._hex(e)}: {self.fn(e)}(); return;')
+                    entry = '' if e == owner else ea._hex(e)
+                    disp.append(f'        case {ea._hex(e)}: '
+                                f'{self.fn(owner)}({entry}); return;')
         disp += ['        default: unhandledDispatch(addr); return;', '    }', '}']
         parts.append('\n'.join(disp))
 
         for e in self.part.entries:
             if e not in rejected and e not in self._manual_functions:
                 parts.append(bodies[e])
+
+        for addr in sorted(self._entry_aliases):
+            if self.part.func_of(addr) not in rejected:
+                parts.append(self._emit_entry_alias_wrapper(addr))
 
         for addr in sorted(self._speculative):
             owner = self.part.func_of(addr)
