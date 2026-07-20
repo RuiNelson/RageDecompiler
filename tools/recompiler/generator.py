@@ -782,13 +782,15 @@ _HEADER_TEMPLATE = '''\
 // Recompiled Streets of Rage cartridge as a RecompilationEnvironment subclass.
 
 #include "RecompilationEnvironment.hpp"
+#include <cstdint>
 #include <string>
 
 class Sor : public RecompilationEnvironment {{
     public:
     explicit Sor(const std::string &romPath,
                  VDP::Synchronization sync    = VDP::VSync,
-                 VDP::Scaling         scaling = VDP::Integer);
+                 VDP::Scaling         scaling = VDP::Integer,
+                 std::uint16_t        remoteAccessPort = 6969);
 
     protected:
     void run() override;
@@ -822,8 +824,8 @@ _SOURCE_PREAMBLE = '''\
 {labelled_entry_log}
 
 Sor::Sor(const std::string &romPath, VDP::Synchronization sync,
-         VDP::Scaling scaling)
-    : RecompilationEnvironment(sync, scaling) {{
+         VDP::Scaling scaling, std::uint16_t remoteAccessPort)
+    : RecompilationEnvironment(sync, scaling, VDP::HardwareSpriteLimit, remoteAccessPort) {{
     loadROM(romPath);
 }}
 

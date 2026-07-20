@@ -558,6 +558,19 @@ def test_partition_assigns_to_nearest_entry():
     assert part.functions[0x100].addrs == [0x100, 0x102]
 
 
+def test_generated_sor_constructor_forwards_remote_access_port():
+    ins = {0x200: _instr('rts', None, [], FlowType.RETURN)}
+    ins[0x200].address = 0x200
+    generator = Generator(ins, {0x200})
+
+    header = generator.emit_header()
+    source = generator.emit_source()
+
+    assert 'std::uint16_t        remoteAccessPort = 6969' in header
+    assert ('RecompilationEnvironment(sync, scaling, VDP::HardwareSpriteLimit, '
+            'remoteAccessPort)') in source
+
+
 def test_branch_between_callable_entries_stays_a_goto():
     ins = {
         0x100: _instr('bra', None, [], FlowType.BRANCH),
