@@ -16,8 +16,8 @@ recompilation repository. `../Genesis-Plus-GX` is an upstream, read-only
 reference and must never be edited.
 
 Before changing files, inspect repository status and preserve unrelated work.
-When an output format changes, inspect every caller and checked-in generated
-consumer before implementing it.
+When an output format changes, inspect every caller and generated consumer
+before implementing it.
 
 ## Repository layout
 
@@ -106,5 +106,7 @@ produce plausible but incorrect output.
 If a tool change intentionally alters the Streets of Rage generated output,
 keep the tool change and consumer regeneration reviewable as separate
 repository changes, explain the expected delta, and validate the rebuilt
-consumer. Do not commit or publish repositories or update the parent gitlink
-unless explicitly requested.
+consumer. After validation, commit and push this repository to `main`
+automatically unless the user explicitly asks not to publish. When checked out
+as a submodule, publish this repository first and then update the parent
+gitlink. Preserve unrelated work and never force-push or rewrite history.
