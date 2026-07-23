@@ -292,7 +292,7 @@ The command prints a table with instruction, subroutine, label, and per-iteratio
 Generate assembly and a coverage map:
 
 ```bash
-./disassemble.sh
+./scripts/disassemble_to_asm
 ```
 
 The script internally calls:
