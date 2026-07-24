@@ -46,7 +46,7 @@ def _run_recompiler(out_dir, *args):
 
 
 def _function_source(source, name):
-    start = source.index(f'void Sor::{name}(')
+    start = source.index(f'void StreetsOfRage::{name}(')
     end = source.find('\n}\n\n', start)
     if end < 0:
         end = source.rindex('\n}', start)
@@ -328,7 +328,7 @@ def test_irq_check_emitted_before_each_instruction():
     assert src.count('BEFORE_INSTRUCTION') == 3
     assert '(void)0;' in src
     assert 'RETURN_68K()' in src
-    assert 'void Sor::serviceIRQ()' in src
+    assert 'void StreetsOfRage::serviceIRQ()' in src
     assert '#define BYTE(v) static_cast<m_byte>(v)' in src
     assert '#define F_Z' not in src
     assert 'cpu().enterInterrupt(level);' in src
@@ -567,7 +567,7 @@ def test_generated_sor_constructor_forwards_remote_access_port():
     source = generator.emit_source()
 
     assert 'std::uint16_t        remoteAccessPort = 6969' in header
-    assert ('RecompilationEnvironment(sync, scaling, VDP::HardwareSpriteLimit, '
+    assert ('MegaDriveEnvironment(sync, scaling, VDP::HardwareSpriteLimit, '
             'remoteAccessPort)') in source
 
 
@@ -587,7 +587,7 @@ def test_branch_between_callable_entries_stays_a_goto():
     assert 'goto L000200;' in body
     assert 'case 0x0200u: goto L000200;' in body
     assert 'case 0x0200u: sub_000100(0x0200u); return;' in src
-    assert 'void Sor::sub_000200(m_long entry_) {\n    sub_000100(entry_);' in src
+    assert 'void StreetsOfRage::sub_000200(m_long entry_) {\n    sub_000100(entry_);' in src
 
 
 def test_indirect_jump_to_grouped_entry_stays_local():
@@ -649,17 +649,15 @@ def test_recompiler_speculative_option_emits_speculative_hooks(tmp_path):
     assert source.count('confirmSpeculative(') > len(raw_candidates)
     # Mid-instruction entries are real lightweight functions which forward to
     # their grouped owner with the precise 68000 address.
-    assert 'void Sor::sub_0003be() {' in source
-    assert re.search(r'void Sor::sub_0003be\(\) \{\n    \w+\(0x03BEu\);', source)
+    assert 'void StreetsOfRage::sub_0003be() {' in source
+    assert re.search(r'void StreetsOfRage::sub_0003be\(\) \{\n    \w+\(0x0*3BEu\);', source)
     assert ('case 0x00012B94u: confirmSpeculative(0x00012B94u); '
             'sub_012b94(); return;') in source
-    assert 'void Sor::sub_012b94() {' in source
-    # $009214 is already baseline code but not a baseline function entry. It
-    # must still be exposed and confirmed during discovery so a mid-function
-    # indirect call does not force exit 42 and a rebuild.
+    assert 'void StreetsOfRage::sub_012b94() {' in source
+    assert re.search(r'void StreetsOfRage::sub_012b94\(\) \{\n    \w+\(0x0*12B94u\);', source)
     assert ('case 0x9214u: confirmSpeculative(0x9214u); '
             'sub_009214(); return;') in source
-    assert 'void Sor::sub_009214() {' in source
+    assert 'void StreetsOfRage::sub_009214() {' in source
     goto_targets = set(re.findall(r'\bgoto ([A-Za-z_][A-Za-z0-9_]*);', source))
     defined_labels = set(re.findall(
         r'^\s*([A-Za-z_][A-Za-z0-9_]*):$', source, flags=re.MULTILINE))
@@ -784,8 +782,8 @@ def test_every_speculative_instruction_has_an_exact_entry_function():
             'sub_000202(); return;') in source
     assert ('case 0x0204u: confirmSpeculative(0x0204u); '
             'sub_000204(); return;') in source
-    assert 'void Sor::sub_000202() {\n    sub_000200(0x0202u);\n}' in source
-    assert 'void Sor::sub_000204() {\n    sub_000200(0x0204u);\n}' in source
+    assert 'void StreetsOfRage::sub_000202() {\n    sub_000200(0x0202u);\n}' in source
+    assert 'void StreetsOfRage::sub_000204() {\n    sub_000200(0x0204u);\n}' in source
     assert 'case 0x0202u: goto L000202;' in _function_source(source, 'sub_000200')
     assert 'case 0x0204u: goto L000204;' in _function_source(source, 'sub_000200')
     assert 'void sub_000202();' in header
@@ -808,7 +806,7 @@ def test_baseline_mid_instruction_is_confirmable_in_discovery():
     assert gen.part.func_of(0x102) == 0x100
     assert ('case 0x0102u: confirmSpeculative(0x0102u); '
             'sub_000102(); return;') in source
-    assert 'void Sor::sub_000102() {\n    sub_000100(0x0102u);\n}' in source
+    assert 'void StreetsOfRage::sub_000102() {\n    sub_000100(0x0102u);\n}' in source
 
 
 def test_overlapping_speculative_flow_keeps_phase2_instruction_ownership():
@@ -857,7 +855,7 @@ def test_invalid_speculative_derived_entry_is_rejected_not_fatal():
                     speculative_scope={0x200, 0x300},
                     baseline_instrs={0x100}).emit_source()
 
-    assert 'void Sor::sub_000300' not in src
+    assert 'void StreetsOfRage::sub_000300' not in src
     assert ('case 0x0200u: confirmSpeculative(0x0200u); '
             'sub_000200(); return;') in src
     assert 'confirmSpeculative(0x0200u);' not in _function_source(src, 'sub_000200')
@@ -899,4 +897,4 @@ def test_manual_function_keeps_declaration_calls_and_dispatch_but_omits_body():
     assert 'void manual_wait(m_long entry_ = 0x0200u);' in header
     assert 'case 0x0200u: manual_wait(); return;' in source
     assert 'CALL(manual_wait,' in _function_source(source, 'sub_000100')
-    assert 'void Sor::manual_wait(' not in source
+    assert 'void StreetsOfRage::manual_wait(' not in source
