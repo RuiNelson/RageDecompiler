@@ -61,10 +61,10 @@ CAST_MACROS = r'''
 #else
 #define RETURN_68K() do { cpu().ssp += 4; return; } while (0)
 #endif
-// Logs only when `addr` is a subroutine entry named in labels.csv
-// (see labelledEntryLog in generated Sor.cpp). Unnamed sub_XXXXXX entries are silent.
+// Diagnostic breadcrumb for control transfers that leave the current C++ body.
+// This is distinct from traceEnter(), which records real subroutine entries.
 void labelledEntryLog(m_long addr);
-#define traceEnter(addr) labelledEntryLog(addr)
+#define traceControl(addr) labelledEntryLog(addr)
 '''
 
 _SIGN = {'b': '0x80u', 'w': '0x8000u', 'l': '0x80000000u'}

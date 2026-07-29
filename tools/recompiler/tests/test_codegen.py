@@ -333,10 +333,16 @@ def test_irq_check_emitted_before_each_instruction():
     assert '#define F_Z' not in src
     assert 'cpu().enterInterrupt(level);' in src
     assert '#include "M68KMacros.hpp"' not in src
-    assert '#define traceEnter(addr) labelledEntryLog(addr)' in src
+    assert '#define traceControl(addr) labelledEntryLog(addr)' in src
     assert 'void labelledEntryLog(m_long addr)' in src
+    assert 'traceEnter(entry_);' in src
     assert '#define CALL(' in src
     assert '#define RETURN_68K()' in src
+
+    header = Generator(ins, {0x100}).emit_header()
+    assert 'void logEntry(m_long entry);' in header
+    assert 'MegaDriveEnvironment::traceEnter(entry);' in header
+    assert 'logEntry(entry);' in header
 
 
 def test_every_instruction_uses_a_brace_block():

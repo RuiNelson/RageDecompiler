@@ -93,6 +93,12 @@ the source subroutine. A single C++ body can group several callable entries and
 non-contiguous ROM regions, so deriving the source statically from the callsite
 can misattribute calls.
 
+Generated functions must also invoke the `StreetsOfRage::traceEnter(entry_)`
+wrapper at their true entry. It retains the host crash breadcrumb and emits an
+optional typed `entry` call-log event. Control-transfer diagnostics inside a
+function use `traceControl` instead and must not be counted as subroutine
+entries.
+
 ## Change rules
 
 - Keep the CLI dependency-light and usable through `python3 -m tools`.

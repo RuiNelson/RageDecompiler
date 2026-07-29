@@ -326,7 +326,7 @@ class Generator:
     def _transfer(self, src_addr, tgt):
         """Unconditional transfer to absolute ``tgt`` (goto or cross-fn call)."""
         if tgt not in self.ins:
-            return [f'traceEnter({ea._hex(src_addr)});',
+            return [f'traceControl({ea._hex(src_addr)});',
                     f'dispatch({ea._hex(tgt)}); return;']
         src_fn = self.part.func_of(src_addr)
         tgt_fn = self.part.func_of(tgt)
@@ -336,7 +336,7 @@ class Generator:
         # If the owning function was rejected (invalid speculative code), fall
         # through to dispatch so the runtime can handle it at run time.
         if tgt_fn in self._rejected:
-            return [f'traceEnter({ea._hex(src_addr)});',
+            return [f'traceControl({ea._hex(src_addr)});',
                     f'dispatch({ea._hex(tgt)}); return;']
         owner = tgt_fn
         return [f'{self.fn(owner)}({ea._hex(tgt)}); return;']
@@ -375,7 +375,7 @@ class Generator:
                               for entry in local_targets]
                     setup += ['    default: break;', '}']
                     addr = target
-                return setup + [f'traceEnter({ea._hex(a)});',
+                return setup + [f'traceControl({ea._hex(a)});',
                                 f'dispatch({addr}); return;']
             return self._transfer(a, instr.targets[0])
 
@@ -391,7 +391,7 @@ class Generator:
                 setup, addr = self._jump_address(instr)
                 # Indirect: evaluate EA then CALL_DISPATCH.
                 return setup + [
-                    f'traceEnter({ea._hex(a)});',
+                    f'traceControl({ea._hex(a)});',
                     f'CALL_DISPATCH({addr}, {source}, {callsite}, {ret});',
                 ]
             tgt = instr.targets[0]
@@ -408,7 +408,7 @@ class Generator:
                         f'{source}, {callsite}, {ea._hex(tgt)}, {ret});'
                     ]
             return [
-                f'traceEnter({ea._hex(a)});',
+                f'traceControl({ea._hex(a)});',
                 f'CALL_DISPATCH({ea._hex(tgt)}, {source}, {callsite}, {ret});',
             ]
 
@@ -887,8 +887,17 @@ class StreetsOfRage : public MegaDriveEnvironment {{
     std::FILE *callLog_ = nullptr;
     std::uint32_t callLogPending_ = 0;
 
+    void logEntry(m_long entry);
     void logCall(m_long source, m_long callsite, m_long target);
     void logCallFromReturn(m_long returnPc, m_long target);
+
+    // All generated and hand-written subroutines already call traceEnter at
+    // their true entry. Keep the host crash breadcrumb and optionally record
+    // the dynamic entry in the same place.
+    void traceEnter(m_long entry) {{
+        MegaDriveEnvironment::traceEnter(entry);
+        logEntry(entry);
+    }}
 
     // Indirect-jump dispatch (jmp (an), computed jumps).
     void dispatch(m_long addr);
