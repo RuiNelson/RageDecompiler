@@ -88,6 +88,11 @@ Keep address-width, endianness, signedness, instruction size, and control-flow
 fallthrough explicit in code and tests. Silent changes in any of these can
 produce plausible but incorrect output.
 
+Generated runtime call logging must use the invocation's dynamic `entry_` as
+the source subroutine. A single C++ body can group several callable entries and
+non-contiguous ROM regions, so deriving the source statically from the callsite
+can misattribute calls.
+
 ## Change rules
 
 - Keep the CLI dependency-light and usable through `python3 -m tools`.

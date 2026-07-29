@@ -381,7 +381,11 @@ class Generator:
 
         if m in ('bsr', 'jsr'):
             ret = ea._hex(nxt)
-            source = ea._hex(self._source_entry(a))
+            # entry_ is the actual 68000 entry used for this invocation. A
+            # grouped C++ body can contain several callable entries and
+            # non-contiguous ROM regions, so choosing a source statically from
+            # the callsite can attribute calls to the wrong subroutine.
+            source = 'entry_'
             callsite = ea._hex(a)
             if m == 'jsr' and (instr.indirect or not instr.targets):
                 setup, addr = self._jump_address(instr)

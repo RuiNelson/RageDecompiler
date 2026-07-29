@@ -538,11 +538,11 @@ def test_jsr_emits_nonlocal_return_guard():
 
     src = Generator(ins, {0x100, 0x200}).emit_source()
 
-    assert 'CALL(sub_000200, 0x0100u, 0x0100u, 0x0200u, 0x0106u);' in src
+    assert 'CALL(sub_000200, entry_, 0x0100u, 0x0200u, 0x0106u);' in src
     assert '#define CALL(' in src
 
 
-def test_jsr_call_log_records_owner_callsite_and_exact_target():
+def test_jsr_call_log_records_dynamic_entry_callsite_and_exact_target():
     ins = {
         0x100: _instr('nop', None, []),
         0x102: _instr('jsr', None, [], FlowType.CALL),
@@ -556,7 +556,7 @@ def test_jsr_call_log_records_owner_callsite_and_exact_target():
 
     src = Generator(ins, {0x100, 0x200}).emit_source()
 
-    assert 'CALL(sub_000200, 0x0100u, 0x0102u, 0x0200u, 0x0108u);' in src
+    assert 'CALL(sub_000200, entry_, 0x0102u, 0x0200u, 0x0108u);' in src
     assert 'logCall(LONG(source), LONG(callsite), LONG(target));' in src
     assert (
         'case 0x0108u: logCall(0x0100u, 0x0102u, target); return;'
@@ -612,7 +612,7 @@ def test_branch_between_callable_entries_stays_a_goto():
     assert 'void StreetsOfRage::sub_000200(m_long entry_) {\n    sub_000100(entry_);' in src
 
 
-def test_call_log_uses_grouped_entry_instead_of_cpp_body_owner():
+def test_call_log_uses_dynamic_entry_for_grouped_cpp_body():
     ins = {
         0x100: _instr('bra', None, [], FlowType.BRANCH),
         0x200: _instr('jsr', None, [], FlowType.CALL),
@@ -627,11 +627,11 @@ def test_call_log_uses_grouped_entry_instead_of_cpp_body_owner():
 
     src = Generator(ins, {0x100, 0x200, 0x300}).emit_source()
 
-    assert 'CALL(sub_000300, 0x0200u, 0x0200u, 0x0300u, 0x0206u);' in src
+    assert 'CALL(sub_000300, entry_, 0x0200u, 0x0300u, 0x0206u);' in src
     assert 'case 0x0206u: logCall(0x0200u, 0x0200u, target); return;' in src
 
 
-def test_call_log_uses_named_entry_inside_grouped_cpp_body():
+def test_call_log_preserves_dynamic_named_entry_inside_grouped_cpp_body():
     ins = {
         0x100: _instr('nop', None, []),
         0x102: _instr('nop', None, []),
@@ -648,7 +648,7 @@ def test_call_log_uses_named_entry_inside_grouped_cpp_body():
         ins, {0x100, 0x200}, names={0x102: 'semantic_entry'}
     ).emit_source()
 
-    assert 'CALL(sub_000200, 0x0102u, 0x0104u, 0x0200u, 0x010Au);' in src
+    assert 'CALL(sub_000200, entry_, 0x0104u, 0x0200u, 0x010Au);' in src
     assert 'case 0x010Au: logCall(0x0102u, 0x0104u, target); return;' in src
 
 
