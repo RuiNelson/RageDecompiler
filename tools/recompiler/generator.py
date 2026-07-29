@@ -201,6 +201,13 @@ class Generator:
         self._all_entries = set(subroutines)
         self.part = partition(instructions, body_entries,
                               owner_overrides=owners)
+        self._source_entries_by_owner = {}
+        source_entries = self._all_entries | (set(self._names) & set(self.ins))
+        for entry in source_entries:
+            owner = self.part.func_of(entry)
+            self._source_entries_by_owner.setdefault(owner, []).append(entry)
+        for entries in self._source_entries_by_owner.values():
+            entries.sort()
         # Functions implemented by hand retain generated declarations, calls,
         # and dispatch entries, but their C++ bodies are omitted.
         # Effective instruction addresses per function.
@@ -302,6 +309,18 @@ class Generator:
             return self.fn(addr)
         return self._spec_fnname[addr]
 
+    def _source_entry(self, address):
+        """Return the human-facing 68000 entry containing ``address``.
+
+        Tail sharing can group several callable or semantically labelled ROM
+        entries into one generated C++ body. The call log must identify the
+        closest such entry, not the implementation owner's earlier address.
+        """
+        owner = self.part.func_of(address)
+        entries = self._source_entries_by_owner[owner]
+        index = bisect.bisect_right(entries, address)
+        return entries[index - 1] if index else owner
+
     # -- control-flow lowering ------------------------------------------------
 
     def _transfer(self, src_addr, tgt):
@@ -362,7 +381,7 @@ class Generator:
 
         if m in ('bsr', 'jsr'):
             ret = ea._hex(nxt)
-            source = ea._hex(self.part.func_of(a))
+            source = ea._hex(self._source_entry(a))
             callsite = ea._hex(a)
             if m == 'jsr' and (instr.indirect or not instr.targets):
                 setup, addr = self._jump_address(instr)
@@ -722,7 +741,7 @@ class Generator:
         for address, instr in self.ins.items():
             if instr.flow is not FlowType.CALL:
                 continue
-            calls[instr.next_address] = (self.part.func_of(address), address)
+            calls[instr.next_address] = (self._source_entry(address), address)
 
         lines = [
             'void StreetsOfRage::logCallFromReturn(m_long returnPc, m_long target) {',

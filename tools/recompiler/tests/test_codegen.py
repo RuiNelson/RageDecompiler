@@ -612,6 +612,46 @@ def test_branch_between_callable_entries_stays_a_goto():
     assert 'void StreetsOfRage::sub_000200(m_long entry_) {\n    sub_000100(entry_);' in src
 
 
+def test_call_log_uses_grouped_entry_instead_of_cpp_body_owner():
+    ins = {
+        0x100: _instr('bra', None, [], FlowType.BRANCH),
+        0x200: _instr('jsr', None, [], FlowType.CALL),
+        0x206: _instr('rts', None, [], FlowType.RETURN),
+        0x300: _instr('rts', None, [], FlowType.RETURN),
+    }
+    ins[0x100].targets = [0x200]
+    ins[0x200].byte_length = 6
+    ins[0x200].targets = [0x300]
+    for address, instruction in ins.items():
+        instruction.address = address
+
+    src = Generator(ins, {0x100, 0x200, 0x300}).emit_source()
+
+    assert 'CALL(sub_000300, 0x0200u, 0x0200u, 0x0300u, 0x0206u);' in src
+    assert 'case 0x0206u: logCall(0x0200u, 0x0200u, target); return;' in src
+
+
+def test_call_log_uses_named_entry_inside_grouped_cpp_body():
+    ins = {
+        0x100: _instr('nop', None, []),
+        0x102: _instr('nop', None, []),
+        0x104: _instr('jsr', None, [], FlowType.CALL),
+        0x10A: _instr('rts', None, [], FlowType.RETURN),
+        0x200: _instr('rts', None, [], FlowType.RETURN),
+    }
+    ins[0x104].byte_length = 6
+    ins[0x104].targets = [0x200]
+    for address, instruction in ins.items():
+        instruction.address = address
+
+    src = Generator(
+        ins, {0x100, 0x200}, names={0x102: 'semantic_entry'}
+    ).emit_source()
+
+    assert 'CALL(sub_000200, 0x0102u, 0x0104u, 0x0200u, 0x010Au);' in src
+    assert 'case 0x010Au: logCall(0x0102u, 0x0104u, target); return;' in src
+
+
 def test_indirect_jump_to_grouped_entry_stays_local():
     ins = {
         0x100: _instr('jmp', None, [EA(EAMode.ADDR_IND, reg=0)],
