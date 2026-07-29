@@ -362,23 +362,31 @@ class Generator:
 
         if m in ('bsr', 'jsr'):
             ret = ea._hex(nxt)
+            source = ea._hex(self.part.func_of(a))
+            callsite = ea._hex(a)
             if m == 'jsr' and (instr.indirect or not instr.targets):
                 setup, addr = self._jump_address(instr)
                 # Indirect: evaluate EA then CALL_DISPATCH.
                 return setup + [
                     f'traceEnter({ea._hex(a)});',
-                    f'CALL_DISPATCH({addr}, {ret});',
+                    f'CALL_DISPATCH({addr}, {source}, {callsite}, {ret});',
                 ]
             tgt = instr.targets[0]
             if tgt in self.ins:
                 owner = self.part.func_of(tgt)
                 if owner not in self._rejected:
                     if owner == tgt:
-                        return [f'CALL({self.fn(owner)}, {ret});']
-                    return [f'CALL_ENTRY({self.fn(owner)}, {ea._hex(tgt)}, {ret});']
+                        return [
+                            f'CALL({self.fn(owner)}, {source}, {callsite}, '
+                            f'{ea._hex(tgt)}, {ret});'
+                        ]
+                    return [
+                        f'CALL_ENTRY({self.fn(owner)}, {ea._hex(tgt)}, '
+                        f'{source}, {callsite}, {ea._hex(tgt)}, {ret});'
+                    ]
             return [
                 f'traceEnter({ea._hex(a)});',
-                f'CALL_DISPATCH({ea._hex(tgt)}, {ret});',
+                f'CALL_DISPATCH({ea._hex(tgt)}, {source}, {callsite}, {ret});',
             ]
 
         if m == 'rts':
@@ -703,6 +711,35 @@ class Generator:
         ]
         return '\n'.join(lines)
 
+    def _emit_call_return_log(self):
+        """Map a synthetic return PC back to its owning call instruction.
+
+        Hand-written replacements retain the original return PCs but do not go
+        through generated CALL macros.  This table lets those replacements log
+        the same source and callsite fields without duplicating ownership data.
+        """
+        calls = {}
+        for address, instr in self.ins.items():
+            if instr.flow is not FlowType.CALL:
+                continue
+            calls[instr.next_address] = (self.part.func_of(address), address)
+
+        lines = [
+            'void StreetsOfRage::logCallFromReturn(m_long returnPc, m_long target) {',
+            '    switch (returnPc & 0x00FFFFFFu) {',
+        ]
+        for return_pc, (source, callsite) in sorted(calls.items()):
+            lines.append(
+                f'        case {ea._hex(return_pc)}: '
+                f'logCall({ea._hex(source)}, {ea._hex(callsite)}, target); return;'
+            )
+        lines += [
+            '        default: logCall(0u, returnPc, target); return;',
+            '    }',
+            '}',
+        ]
+        return '\n'.join(lines)
+
     def _emit_source_body(self):
         boot = self.fn(self.part.func_of(0x000200))
         parts = [_SOURCE_PREAMBLE.format(cast_macros=sem.CAST_MACROS.strip(),
@@ -758,6 +795,7 @@ class Generator:
                     disp.append(f'        case {ea._hex(e)}: '
                                 f'{self.fn(owner)}({entry}); return;')
         disp += ['        default: unhandledDispatch(addr); return;', '    }', '}']
+        parts.append(self._emit_call_return_log())
         parts.append('\n'.join(disp))
 
         for e in self.part.entries:
@@ -784,6 +822,7 @@ _HEADER_TEMPLATE = '''\
 
 #include "CPU68K.hpp"
 #include "MegaDriveEnvironment.hpp"
+#include <cstdio>
 #include <cstdint>
 #include <string>
 
@@ -793,6 +832,9 @@ class StreetsOfRage : public MegaDriveEnvironment {{
                            VDP::Synchronization sync    = VDP::VSync,
                            VDP::Scaling         scaling = VDP::Integer,
                            std::uint16_t        remoteAccessPort = 6969);
+    ~StreetsOfRage();
+
+    void setCallLog(const std::string &path);
 
     protected:
     void run() override;
@@ -819,6 +861,11 @@ class StreetsOfRage : public MegaDriveEnvironment {{
 
     private:
     CPU68K cpu_;
+    std::FILE *callLog_ = nullptr;
+    std::uint32_t callLogPending_ = 0;
+
+    void logCall(m_long source, m_long callsite, m_long target);
+    void logCallFromReturn(m_long returnPc, m_long target);
 
     // Indirect-jump dispatch (jmp (an), computed jumps).
     void dispatch(m_long addr);

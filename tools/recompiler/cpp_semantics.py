@@ -23,25 +23,29 @@ CAST_MACROS = r'''
 #define SEX_B(v) static_cast<m_long>(static_cast<int32_t>(static_cast<int8_t>(v)))
 #define BEFORE_INSTRUCTION if (irqLevel() > cpu().interruptMask()) serviceIRQ(); pace();
 // Emulated 68000 subroutine call/return (native C++ call + soft stack).
-#define CALL(fn, ret_pc) do { \
+#define CALL(fn, source, callsite, target, ret_pc) do { \
     m_long _call_sp = cpu().ssp; \
+    logCall(LONG(source), LONG(callsite), LONG(target)); \
     cpu().ssp -= 4; \
     memory().writeLong(cpu().ssp, LONG(ret_pc)); \
     (fn)(); \
     if ((cpu().ssp & 0x00FFFFFFu) > (_call_sp & 0x00FFFFFFu)) return; \
 } while (0)
-#define CALL_ENTRY(fn, entry, ret_pc) do { \
+#define CALL_ENTRY(fn, entry, source, callsite, target, ret_pc) do { \
     m_long _call_sp = cpu().ssp; \
+    logCall(LONG(source), LONG(callsite), LONG(target)); \
     cpu().ssp -= 4; \
     memory().writeLong(cpu().ssp, LONG(ret_pc)); \
     (fn)(entry); \
     if ((cpu().ssp & 0x00FFFFFFu) > (_call_sp & 0x00FFFFFFu)) return; \
 } while (0)
-#define CALL_DISPATCH(addr, ret_pc) do { \
+#define CALL_DISPATCH(addr, source, callsite, ret_pc) do { \
     m_long _call_sp = cpu().ssp; \
+    m_long _call_target = LONG(addr); \
+    logCall(LONG(source), LONG(callsite), _call_target); \
     cpu().ssp -= 4; \
     memory().writeLong(cpu().ssp, LONG(ret_pc)); \
-    dispatch(addr); \
+    dispatch(_call_target); \
     if ((cpu().ssp & 0x00FFFFFFu) > (_call_sp & 0x00FFFFFFu)) return; \
 } while (0)
 #ifdef SOR_TRACE

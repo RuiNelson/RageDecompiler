@@ -538,8 +538,30 @@ def test_jsr_emits_nonlocal_return_guard():
 
     src = Generator(ins, {0x100, 0x200}).emit_source()
 
-    assert 'CALL(' in src and '0x0106u' in src
+    assert 'CALL(sub_000200, 0x0100u, 0x0100u, 0x0200u, 0x0106u);' in src
     assert '#define CALL(' in src
+
+
+def test_jsr_call_log_records_owner_callsite_and_exact_target():
+    ins = {
+        0x100: _instr('nop', None, []),
+        0x102: _instr('jsr', None, [], FlowType.CALL),
+        0x108: _instr('rts', None, [], FlowType.RETURN),
+        0x200: _instr('rts', None, [], FlowType.RETURN),
+    }
+    ins[0x102].byte_length = 6
+    ins[0x102].targets = [0x200]
+    for address in ins:
+        ins[address].address = address
+
+    src = Generator(ins, {0x100, 0x200}).emit_source()
+
+    assert 'CALL(sub_000200, 0x0100u, 0x0102u, 0x0200u, 0x0108u);' in src
+    assert 'logCall(LONG(source), LONG(callsite), LONG(target));' in src
+    assert (
+        'case 0x0108u: logCall(0x0100u, 0x0102u, target); return;'
+        in src
+    )
 
 
 def test_partition_assigns_to_nearest_entry():
