@@ -27,7 +27,7 @@ _COMMANDS: dict[str, Command] = {
     'recompile': (
         'tools.recompiler.main',
         'main',
-        'Static 68000-to-C++ recompiler; writes Sor.hpp / Sor.cpp.',
+        'Static 68000-to-C++ recompiler; writes split SoR C++ files.',
     ),
     'speculative-scan': (
         'tools.speculative_scan.main',

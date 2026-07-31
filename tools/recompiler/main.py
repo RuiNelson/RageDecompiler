@@ -1,4 +1,4 @@
-"""CLI: recompile the ROM into a Sor.hpp / Sor.cpp RecompilationEnvironment subclass.
+"""CLI: recompile the ROM into split SoR C++ translation units.
 
     python3 -m tools.recompiler rom/StreetsOfRage.bin -o src/generated [--aux aux_addresses.txt]
 
@@ -11,6 +11,7 @@ compile-safe stubs (unimplemented opcodes), broken down by mnemonic.
 import argparse
 import bisect
 import os
+import re
 import sys
 
 from tools.disassembler.disassembler import Disassembler
@@ -438,7 +439,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description='Recompile the SoR ROM to C++.')
     ap.add_argument('rom', help='path to the ROM binary')
     ap.add_argument('-o', '--out-dir', default='src/generated',
-                    help='output directory for Sor.hpp / Sor.cpp')
+                    help='output directory for SoR.hpp / SoR-common.hpp / SoR-XXX.cpp')
     ap.add_argument('--aux', default='code-analysis/aux_addresses.txt',
                     help='auxiliary entry-point address file: indirect-jump '
                          'targets from the active disassembly (optional)')
@@ -540,14 +541,23 @@ def main(argv=None):
                     confirm_addrs=confirm_entries,
                     rom=rom,
                     log_labels=log_labels)
-    source = gen.emit_source()   # must run first — populates self._rejected
+    sources = gen.emit_sources()  # must run first — populates self._rejected
     header = gen.emit_header()
+    common_header = gen.emit_common_header()
 
     os.makedirs(args.out_dir, exist_ok=True)
-    with open(os.path.join(args.out_dir, 'Sor.hpp'), 'w') as f:
+    # Remove obsolete groups from previous runs as well as the legacy pair.
+    for filename in os.listdir(args.out_dir):
+        if (re.fullmatch(r'SoR-[0-9A-F]{3}\.cpp', filename)
+                or filename in {'Sor.cpp', 'Sor.hpp'}):
+            os.unlink(os.path.join(args.out_dir, filename))
+    with open(os.path.join(args.out_dir, 'SoR.hpp'), 'w') as f:
         f.write(header)
-    with open(os.path.join(args.out_dir, 'Sor.cpp'), 'w') as f:
-        f.write(source)
+    with open(os.path.join(args.out_dir, 'SoR-common.hpp'), 'w') as f:
+        f.write(common_header)
+    for group, source in sources.items():
+        with open(os.path.join(args.out_dir, f'SoR-{group}.cpp'), 'w') as f:
+            f.write(source)
 
     s = gen.stats
     total = s.handled + s.stubbed
@@ -561,7 +571,8 @@ def main(argv=None):
         top = sorted(s.stub_mnemonics.items(), key=lambda kv: -kv[1])
         print('[recompile] stubbed opcodes: ' +
               ', '.join(f'{m}×{n}' for m, n in top))
-    print(f'[recompile] wrote {args.out_dir}/Sor.hpp, {args.out_dir}/Sor.cpp')
+    print(f'[recompile] wrote {args.out_dir}/SoR.hpp, '
+          f'{args.out_dir}/SoR-common.hpp, {len(sources)} SoR-XXX.cpp file(s)')
     return 0
 
 

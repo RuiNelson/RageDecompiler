@@ -10,6 +10,6 @@ Pipeline
 ``opcodes``        Instruction → C++ statement(s) (operation + CCR flags).
 ``ccr_liveness``   Per-flag CCR liveness; dead flag updates are omitted.
 ``regions``        Partition instructions into functions; loops stay as loops.
-``generator``      Orchestrate emission of the Sor.hpp / Sor.cpp pair.
+``generator``      Orchestrate emission of split SoR headers and sources.
 ``main``           CLI entry point.
 """

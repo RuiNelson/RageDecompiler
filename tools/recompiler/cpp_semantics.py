@@ -1,6 +1,6 @@
 """C++ statement snippets for 68000 opcode semantics.
 
-The recompiler emits these semantics directly into ``Sor.cpp``. The only
+The recompiler emits these semantics into the generated ``SoR-common.hpp``. The only
 generated macros are the one-line cast shorthands below, kept as a small visual
 aid for otherwise noisy ``static_cast`` expressions.
 

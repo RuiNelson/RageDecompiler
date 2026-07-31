@@ -19,7 +19,7 @@ python3 -m tools --help
 | Command | Purpose |
 | --- | --- |
 | `disassemble` | Disassemble the 68000 ROM to assembly and optionally write a coverage map. |
-| `recompile` | Recompile the ROM to C++ (`Sor.hpp` / `Sor.cpp`). |
+| `recompile` | Recompile the ROM to split C++ files (`SoR.hpp`, `SoR-common.hpp`, and `SoR-XXX.cpp`). |
 | `speculative-scan` | Find candidate entry points in ROM regions that are still unknown. |
 | `remove-data` | Remove assembly blocks that contain data directives. |
 | `label-diff` | Print labels that exist in the second `.asm` file but not in the first. |
@@ -114,7 +114,7 @@ Arguments and options:
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
 | `<rom>` | Yes | | Path to the ROM binary. |
-| `-o, --out-dir <dir>` | No | `src/generated` | Directory where `Sor.hpp` and `Sor.cpp` are written. |
+| `-o, --out-dir <dir>` | No | `src/generated` | Directory where `SoR.hpp`, `SoR-common.hpp`, and `SoR-XXX.cpp` are written. |
 | `--aux <file>` | No | `code-analysis/aux_addresses.txt` | Known auxiliary entry points. |
 | `--speculative <file>` | No | empty | Speculative candidates whose decoded instructions are all compiled as exact entries with confirmation hooks. |
 | `--labels-csv <file>` | No | `code-analysis/labels.csv` | CSV of code segment names. |
@@ -124,7 +124,7 @@ Arguments and options:
 
 Notes:
 
-- The generated `Sor.cpp` is self-contained; it emits small one-line cast macros and all 68000 instruction semantics directly.
+- `SoR-common.hpp` contains the shared includes and cast macros. Each `SoR-XXX.cpp` contains subroutines whose first entry address starts with the three hexadecimal digits `XXX`.
 - If `--speculative` is not provided, no `confirmSpeculative` hooks are emitted.
 - Each valid instruction reached only from a speculative candidate gets its own
   lightweight C++ entry function. The recompiler also validates every aligned

@@ -689,11 +689,41 @@ def test_load_aux_empty_path_disables_optional_inputs():
 
 def test_recompiler_default_emits_no_speculative_hooks(tmp_path):
     out = tmp_path / 'normal'
+    out.mkdir()
+    (out / 'Sor.cpp').write_text('legacy source')
+    (out / 'SoR-FFF.cpp').write_text('obsolete group')
 
     _run_recompiler(out)
 
-    source = (out / 'Sor.cpp').read_text()
+    source = '\n'.join(
+        path.read_text() for path in sorted(out.glob('SoR-???.cpp')))
     assert 'confirmSpeculative(' not in source
+    assert (out / 'SoR.hpp').is_file()
+    assert (out / 'SoR-common.hpp').is_file()
+    assert '#include "SoR.hpp"' in (out / 'SoR-common.hpp').read_text()
+    assert not (out / 'Sor.cpp').exists()
+    assert not (out / 'SoR-FFF.cpp').exists()
+
+
+def test_generated_sources_are_grouped_by_first_three_entry_address_digits():
+    ins = {
+        0x000200: _instr('rts', None, [], FlowType.RETURN),
+        0x012000: _instr('rts', None, [], FlowType.RETURN),
+        0x012ABC: _instr('rts', None, [], FlowType.RETURN),
+        0x123456: _instr('rts', None, [], FlowType.RETURN),
+    }
+    for address, instruction in ins.items():
+        instruction.address = address
+
+    sources = Generator(ins, set(ins)).emit_sources()
+
+    assert list(sources) == ['000', '012', '123']
+    assert 'sub_000200' in sources['000']
+    assert 'sub_012000' in sources['012']
+    assert 'sub_012abc' in sources['012']
+    assert 'sub_123456' in sources['123']
+    assert all('#include "SoR-common.hpp"' in source
+               for source in sources.values())
 
 
 def test_recompiler_speculative_option_emits_speculative_hooks(tmp_path):
@@ -709,7 +739,8 @@ def test_recompiler_speculative_option_emits_speculative_hooks(tmp_path):
     _run_recompiler(out, '--aux', str(aux),
                     '--speculative', 'code-analysis/speculative_addresses.txt')
 
-    source = (out / 'Sor.cpp').read_text()
+    source = '\n'.join(
+        path.read_text() for path in sorted(out.glob('SoR-???.cpp')))
     raw_candidates = _load_aux(
         _FIXTURE_ROOT / 'code-analysis/speculative_addresses.txt')
     # Every instruction reached only by the speculative phase is exposed, so
